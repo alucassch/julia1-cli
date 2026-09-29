@@ -27,7 +27,8 @@ the validation protocol.
 **llama.cpp support.** [llama.cpp PR #29363](https://github.com/ggml-org/llama.cpp/pull/29363) adds support for this
 family of decision models (the `laya` architecture). `Julia-1-laya-F32.gguf` is exported in that layout and already
 reproduces the original PyTorch model on the PR's runtime (2000/2000 decisions on the typed-decisions test set, PR
-commit `ffc55c93bc`, CPU). Once the PR is merged, that file should run in upstream llama.cpp without julia1-cli.
+commit `ffc55c93bc`, CPU); that commit fixes the issues found while validating Julia-1 on the PR
+([report](https://github.com/ggml-org/llama.cpp/pull/29363#issuecomment-5861969778)). If the PR is merged, that file should run in upstream llama.cpp without julia1-cli.
 The PR's CLI (`llama-laya-cli`) does not yet encode `noul` questions that carry descriptions the way Julia-1 does.
 Until then, use julia1-cli or the `julia1-gguf` Python package.
 

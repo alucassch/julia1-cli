@@ -27,7 +27,8 @@ codificação das requisições, o forward e o protocolo de validação.
 **Suporte no llama.cpp.** O [PR #29363 do llama.cpp](https://github.com/ggml-org/llama.cpp/pull/29363) adiciona
 suporte a essa família de modelos de decisão (a arquitetura `laya`). O `Julia-1-laya-F32.gguf` é exportado nesse
 formato e já reproduz o modelo original em PyTorch no runtime do PR (2000/2000 decisões no conjunto de teste
-typed-decisions, commit `ffc55c93bc`, CPU). Quando o PR for integrado, esse arquivo deve rodar no llama.cpp oficial
+typed-decisions, commit `ffc55c93bc`, CPU); esse commit corrige os problemas encontrados ao validar o Julia-1 no PR
+([relato](https://github.com/ggml-org/llama.cpp/pull/29363#issuecomment-5861969778)). Se o PR for integrado, esse arquivo deve rodar no llama.cpp oficial
 sem o julia1-cli. A CLI do PR (`llama-laya-cli`) ainda não codifica como o Julia-1 as perguntas `noul` que têm
 descrições. Até lá, use o julia1-cli ou o pacote Python `julia1-gguf`.
 
