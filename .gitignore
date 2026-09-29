@@ -1,0 +1,12 @@
+# Build trees (cmake downloads llama.cpp v0.5.0 into the build directory) and release files
+/build*/
+/dist/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+
+# Model files are downloaded separately (https://huggingface.co/andrelucas/Julia-1-GGUF)
+*.gguf
+
+.DS_Store

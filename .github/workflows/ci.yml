@@ -1,0 +1,78 @@
+# CI for julia1-cli. No secrets are used.
+#  - macos:  macOS 14 arm64: configure (downloads llama.cpp v0.5.0, SHA-256 pinned, and patches its ggml), build,
+#            --version / --help, the cmake --install layout, and the Python tools' syntax. No model is needed.
+#  - model:  runs only when the repository variable JULIA1_MODEL_URL is set (Settings > Secrets and variables > Actions >
+#            Variables), e.g. https://huggingface.co/andrelucas/Julia-1-GGUF/resolve/main/Julia-1-F32.gguf: downloads
+#            that F32 file and runs the parity guards on the CPU (the reference data/reference/parity.jsonl is in the
+#            repository). GitHub's macOS runners are virtual machines, so Metal is not exercised.
+#  - linux:  Ubuntu 24.04, CPU-only build + --version. Experimental: allowed to fail.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 3
+      - name: Version and help
+        run: |
+          build/julia1-cli --version
+          build/julia1-cli --version | grep -E "^julia1-cli $(sed -nE 's/^project\(julia1-gguf VERSION ([0-9.]+) .*/\1/p' CMakeLists.txt) \(ggml .*, exact kernels\)$"
+          grep -q "^version = \"$(sed -nE 's/^project\(julia1-gguf VERSION ([0-9.]+) .*/\1/p' CMakeLists.txt)\"$" pyproject.toml
+          build/julia1-cli --help
+      - name: Install layout
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/prefix"
+          (cd "$RUNNER_TEMP/prefix" && find . -type f | sort) | tee files.txt
+          printf '%s\n' ./bin/julia1-cli ./include/julia1_gguf.h ./lib/libjulia1_gguf_native.dylib \
+            ./share/julia1-cli/LICENSE ./share/julia1-cli/NOTICE ./share/julia1-cli/README-quickstart.md \
+            ./share/julia1-cli/THIRD_PARTY_LICENSES | diff - files.txt
+          otool -L "$RUNNER_TEMP/prefix/bin/julia1-cli"
+      - name: Python syntax
+        run: python3 -m py_compile julia1_gguf/*.py tools/*.py
+
+  model:
+    if: ${{ vars.JULIA1_MODEL_URL != '' }}
+    needs: macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DJULIA1_BUILD_SHARED=OFF
+          cmake --build build -j 3
+      - name: Download the F32 model
+        env:
+          JULIA1_MODEL_URL: ${{ vars.JULIA1_MODEL_URL }}
+        run: curl -fL --retry 3 -o Julia-1-F32.gguf "$JULIA1_MODEL_URL"
+      - name: Parity guards (CPU, exact)
+        run: |
+          python3 tools/eval_gguf.py --runtime cli --cli build/julia1-cli --model Julia-1-F32.gguf --device cpu --threads 3 \
+            --suite parity --mode replay --min-argmax 100 --max-abs 2e-3
+          python3 tools/eval_gguf.py --runtime cli --cli build/julia1-cli --model Julia-1-F32.gguf --device cpu --threads 3 \
+            --suite parity --mode e2e --min-argmax 100 --max-abs 2e-3
+
+  # Experimental: the Linux CPU build is not validated against the reference data yet; a failure does not fail the
+  # workflow.
+  linux:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (CPU only)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Version
+        run: build/julia1-cli --version

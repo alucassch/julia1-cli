@@ -1,0 +1,38 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "julia1-gguf"
+version = "0.1.0"
+description = "Julia-1 decision model in GGUF: native C++/ggml runtime (Metal/CPU), pure numpy runtime, tokenizer and evaluation tools"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.24", "gguf>=0.17"]
+
+[project.optional-dependencies]
+fast = ["tokenizers>=0.19"]
+
+[project.urls]
+Homepage = "https://github.com/alucassch/julia1-cli"
+Models = "https://huggingface.co/andrelucas/Julia-1-GGUF"
+Upstream = "https://huggingface.co/SupersonicLabs/Julia-1"
+
+[project.scripts]
+julia1-gguf = "julia1_gguf.__main__:main"
+
+# pip install . configures CMakeLists.txt (which downloads llama.cpp v0.5.0 for ggml, as for julia1-cli), builds only the
+# shared library julia1_gguf_native and installs it inside the julia1_gguf package. Offline:
+# -C cmake.define.FETCHCONTENT_SOURCE_DIR_LLAMA_CPP=<absolute path of an unpacked llama.cpp v0.5.0>.
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.18"
+wheel.packages = ["julia1_gguf"]
+wheel.py-api = "py3"              # ctypes: no CPython ABI in the library
+install.components = ["python"]   # not ggml's own install rules
+wheel.license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES"]  # the library links ggml, json (MIT)
+build-dir = "build-py/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+JULIA1_BUILD_CLI = "OFF"

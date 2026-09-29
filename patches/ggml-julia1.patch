@@ -1,0 +1,1318 @@
+ggml patches for llama.cpp v0.5.0 (ggml 0.25.1), used by julia1-cli (https://github.com/alucassch/julia1-cli).
+Paths are relative to the llama.cpp root: `patch -p1` (or `git apply`) there, or `patch -p2` inside a copy of its ggml/.
+CMakeLists.txt applies it to a copy of the fetched ggml/ in the build directory (JULIA1_GGML_PATCH=ON, the default).
+SPDX-License-Identifier: MIT
+Copyright (c) 2026 the julia1-cli authors. MIT like ggml, so that the changes can go upstream (the rest of julia1-cli
+is Apache-2.0); the license text is in THIRD_PARTY_LICENSES, entry (1).
+
+Changes (the comments in the code carry the same labels):
+  P1   Metal: exact kernel_mul_mm variants that stage the operands as float (F32 weights) or half (F16 weights, lossless),
+       selected by ggml_prec_set_src(mul_mat, GGML_PREC_F32, 1)
+  P2   Metal: exact flash attention that stages Q as float (non-vec kernel, F32 K/V, dk = dv = 64), selected by
+       ggml_prec_set_acc(flash_attn_ext, GGML_PREC_F32)
+  P3   CPU (aarch64 NEON): vectorised GEGLU with erf
+  P4   CPU: flash attention chunked by whole Q tiles
+  P6   Metal: residual ADD fused into the kernel_mul_mm epilogue
+  P7   Metal: GEGLU fused into the kernel_mul_mm epilogue
+  P8   Metal: bias, ReLU and residual fused into the kernel_mul_mm epilogue
+  P9   Metal: NEOX RoPE fused into the kernel_mul_mm epilogue
+  P10  Metal: kernel_mul_mm_t, smaller GEMM tiles for small grids
+  P11  Metal: flash attention with n_kv % 64 != 0 (K/V padding copies only the row payload; a fully masked partial last
+       KV block is skipped)
+  P12  CPU (Apple): large F32 matmuls through Accelerate inside the CPU backend
+ggml.h defines GGML_JULIA1_EXACT_MM (P1, P2), GGML_JULIA1_FA_KVPAD (P11) and, on Apple, GGML_JULIA1_CPU_ACCELERATE (P12).
+
+diff -ru a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1476,6 +1476,18 @@
+             enum ggml_prec       prec,
+             int                  idx);
+ 
++    // julia1 patch P1, P2: the Metal backend honours ggml_prec_set_src(mul_mat, GGML_PREC_F32, 1) and
++    // ggml_prec_set_acc(flash_attn_ext, GGML_PREC_F32) with float-staged kernel variants
++#define GGML_JULIA1_EXACT_MM 1
++    // julia1 patch P11: Metal flash attention with n_kv % 64 != 0 costs about what the next multiple of 64 does (the
++    // kvpad pre-pass copies only the rows' payload; a partial last KV block is skipped when fully masked)
++#define GGML_JULIA1_FA_KVPAD 1
++    // julia1 patch P12: on Apple the CPU backend (built with GGML_ACCELERATE, ggml's default there) runs large F32 x F32
++    // matmuls through Accelerate itself, as the BLAS backend would
++#if defined(__APPLE__)
++#define GGML_JULIA1_CPU_ACCELERATE 1
++#endif
++
+     // A: k columns, n rows => [ne03, ne02, n, k]
+     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
+     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
+diff -ru a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1292,6 +1292,29 @@
+     // nb01 >= nb00 - src0 is not transposed
+     //   compute by src0 rows
+ 
++#if defined(GGML_USE_ACCELERATE)
++    // julia1 patch P12: large F32 x F32 matmuls through Accelerate's cblas_sgemm (AMX), selected and called as the BLAS
++    // backend does (contiguous operands, ne0, ne1, ne10 >= 32), so that the CPU backend runs the whole graph alone.
++    // Thread 0 makes the call (Accelerate threads it); the others wait at the next barrier.
++    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
++        ne0 >= 32 && ne1 >= 32 && ne10 >= 32) {
++        if (ith == 0) {
++            const int64_t r2 = ne12/ne02;
++            const int64_t r3 = ne13/ne03;
++            for (int64_t i13 = 0; i13 < ne13; i13++) {
++                for (int64_t i12 = 0; i12 < ne12; i12++) {
++                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
++                                ne1, ne01, ne10,
++                                1.0f, (const float *) ((const char *) src1->data + i12*nb12    + i13*nb13),    ne10,
++                                      (const float *) ((const char *) src0->data + i12/r2*nb02 + i13/r3*nb03), ne00,
++                                0.0f, (float *)       ((char *)       dst->data  + i12*nb2     + i13*nb3),     ne01);
++                }
++            }
++        }
++        return;
++    }
++#endif
++
+     // TODO: extract to "extra_op"
+ #if GGML_USE_LLAMAFILE
+     // broadcast factors
+diff -ru a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9330,15 +9330,25 @@
+ #endif
+         int current_chunk = ith;
+ 
+-        while (current_chunk < nchunk) {
++        if (use_tiled) {
++            // julia1 patch P4: one chunk per Q tile of one head, so that no tile is cut by a chunk boundary (the tile
++            // kernel always computes Q_TILE_SZ rows)
++            const int64_t tiles_per_head = (neq1 + Q_TILE_SZ - 1) / Q_TILE_SZ;
++            const int64_t n_tiles        = tiles_per_head * neq2 * neq3;
++            while (current_chunk < n_tiles) {
++                const int64_t q0  = (current_chunk % tiles_per_head) * Q_TILE_SZ;
++                const int64_t ir0 = (current_chunk / tiles_per_head) * neq1 + q0;
++                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir0 + MIN(Q_TILE_SZ, neq1 - q0));
++
++                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
++            }
++        }
++
++        while (!use_tiled && current_chunk < nchunk) {
+             const int64_t ir0 = dr * current_chunk;
+             const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
+-            if (use_tiled) {
+-                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+-            } else {
+-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+-            }
++            ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+ 
+             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+         }
+diff -ru a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1163,6 +1163,27 @@
+     return vdivq_f32(x, one_plus_exp_neg_x);
+ }
+ 
++// julia1 patch P3: 1 + erf(x) in single precision vector, as erfc(-x) with erfc from the Chebyshev fit of Numerical
++// Recipes (erfcc, fractional error < 1.2e-7 everywhere), so that GELU keeps its relative precision for negative inputs
++// too
++inline static float32x4_t ggml_v_one_plus_erf(float32x4_t x) {
++    const float32x4_t one = vdupq_n_f32(1.0f);
++    const float32x4_t z = vabsq_f32(x);
++    const float32x4_t t = vdivq_f32(one, vfmaq_f32(one, vdupq_n_f32(0.5f), z));
++    float32x4_t p = vfmaq_f32(vdupq_n_f32(-0.82215223f), vdupq_n_f32(0.17087277f), t);
++    p = vfmaq_f32(vdupq_n_f32(1.48851587f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(-1.13520398f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(0.27886807f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(-0.18628806f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(0.09678418f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(0.37409196f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(1.00002368f), p, t);
++    p = vfmaq_f32(vdupq_n_f32(-1.26551223f), p, t);
++    const float32x4_t erfc = vmulq_f32(t, ggml_v_expf(vfmsq_f32(p, z, z))); // erfc(|x|) = t exp(p - x^2)
++    return vbslq_f32(vcltzq_f32(x), erfc, vsubq_f32(vdupq_n_f32(2.0f), erfc));
++}
++#define GGML_V_ERF_NEON
++
+ #elif defined(__AVX512F__) && defined(__AVX512DQ__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1453,7 +1474,16 @@
+ }
+ 
+ inline static void ggml_vec_geglu_erf_f32(const int n, float * y, const float * x, const float * g) {
+-    for (int i = 0; i < n; ++i) {
++    int i = 0;
++#ifdef GGML_V_ERF_NEON // julia1 patch P3: 4 lanes at a time instead of scalar erff
++    const float32x4_t half = vdupq_n_f32(0.5f), s = vdupq_n_f32(SQRT_2_INV);
++    for (; i + 3 < n; i += 4) {
++        const float32x4_t xi = vld1q_f32(x + i);
++        const float32x4_t e1 = ggml_v_one_plus_erf(vmulq_f32(xi, s));
++        vst1q_f32(y + i, vmulq_f32(vmulq_f32(vmulq_f32(half, xi), e1), vld1q_f32(g + i)));
++    }
++#endif
++    for (; i < n; ++i) {
+         float xi = x[i];
+         y[i] = 0.5f * xi * (1.0f + erff(xi*SQRT_2_INV)) * g[i];
+     }
+diff -ru a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "ggml-impl.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <memory>
+ #include <string>
+@@ -791,7 +792,37 @@
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
++// julia1 patch P10: the tiles of kernel_mul_mm_t (kernels/mul_mm.metal instantiates each for F32/F16 weights, fast and
++// p32): nr0 rows of src0 by nr1 columns of src1, K steps of 32; "_pf": register prefetch of the next K step
++struct ggml_metal_mm_tile { const char * name; int16_t nr0, nr1; };
++
++static const ggml_metal_mm_tile ggml_metal_mm_tiles[] = {
++    { "32x16_pf", 32, 16 },
++    { "32x32_pf", 32, 32 },
++    { "48x32",    48, 32 },
++};
++
++// julia1 patch P10: the kernel_mul_mm_t tile for this matmul, or nullptr for the stock kernel_mul_mm (64x32 tiles). With
++// few stock threadgroups most of the GPU idles, and smaller tiles (the smallest also with register prefetch) finish
++// sooner: up to 12 stock threadgroups 32x16 prefetch, up to 24 32x32 prefetch, up to 36 48x32, more: stock.
++static const ggml_metal_mm_tile * ggml_metal_mm_pick_tile(const ggml_tensor * op, int epi) {
++    if ((op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) || op->src[1]->type != GGML_TYPE_F32) {
++        return nullptr;
++    }
++
++    const int64_t n = ((op->ne[0] + 63)/64)*((op->ne[1] + 31)/32)*op->ne[2]*op->ne[3];
++    const ggml_metal_mm_tile * t = n <= 12 ? &ggml_metal_mm_tiles[0] : n <= 24 ? &ggml_metal_mm_tiles[1] : n <= 36 ? &ggml_metal_mm_tiles[2] : nullptr;
++
++    // no bounds checks in kernel_mul_mm_t; the ROPE epilogue rotates whole heads of 64 rows within a tile
++    if (!t || op->src[0]->ne[0] % 32 != 0 || op->ne[0] % t->nr0 != 0 || op->ne[1] % t->nr1 != 0 ||
++        ((epi & MM_EPI_ROPE) && t->nr0 % 64 != 0)) {
++        return nullptr;
++    }
++
++    return t;
++}
++
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, int epi) {
+     char base[256];
+     char name[256];
+ 
+@@ -815,10 +846,18 @@
+     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
+     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+ 
+-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
++    // julia1 patch P1: ggml_prec_set_src(op, GGML_PREC_F32, 1) selects the exact variants that stage the operands in
++    // threadgroup memory as float (F32 src0 and src1) or half (F16 src0, lossless) instead of half
++    const bool p32 = !has_tensor && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32 && tsrc1 == GGML_TYPE_F32 &&
++        (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16);
+ 
++    const ggml_metal_mm_tile * tile = has_tensor ? nullptr : ggml_metal_mm_pick_tile(op, epi); // julia1 patch P10
++
++    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), p32 ? "_p32" : "",
++             tile ? "_t" : "", tile ? tile->name : "");
++    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_epi=%d",
++             base, bc_inp, bc_out, ne12, ne13, r2, r3, epi);
++
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         ggml_metal_cv_t cv = ggml_metal_cv_init();
+@@ -829,6 +868,7 @@
+         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
++        ggml_metal_cv_set_int16(cv, epi,   FC_MUL_MM + 7); // julia1 patch P6-P9: fused epilogue (legacy kernel only)
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+@@ -841,11 +881,23 @@
+ 
+         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
+         res.smem = smem_a;
++    } else if (tile) {
++        // julia1 patch P10: the A and B tiles at their staging precision; the fused epilogues stage the float result tile
++        const size_t s0 = p32 && tsrc0 == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
++        const size_t s1 = p32 ? sizeof(float) : sizeof(ggml_fp16_t);
++        res.nr0  = tile->nr0;
++        res.nr1  = tile->nr1;
++        res.smem = std::max<size_t>(32*(tile->nr0*s0 + tile->nr1*s1), epi ? tile->nr0*tile->nr1*sizeof(float) : 0);
+     } else {
+         res.nr0 = 64;
+         res.nr1 = 32;
+ 
+-        res.smem = bc_out ? 8192 : (4096 + 2048);
++        // julia1 patch P6-P9: the fused epilogues stage the 64x32 float tile like bc_out
++        res.smem = bc_out || epi ? 8192 : (4096 + 2048);
++        if (p32) { // julia1 patch P1: sa = 64x32 S0, sb = 32x32 float; the bc_out staging area needs 8192
++            const size_t s0 = tsrc0 == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
++            res.smem = std::max<size_t>(bc_out || epi ? 8192 : 0, 64*32*s0 + 32*32*sizeof(float));
++        }
+     }
+ 
+     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+@@ -1715,6 +1767,12 @@
+     return res;
+ }
+ 
++bool ggml_metal_op_flash_attn_ext_p32(const ggml_tensor * op) { // julia1 patch P2
++    return ggml_get_op_params_i32(op, 3) == GGML_PREC_F32 &&
++        op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
++        op->src[1]->ne[0] == 64 && op->src[2]->ne[0] == 64;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
+         ggml_metal_library_t lib,
+         const ggml_tensor * op,
+@@ -1740,9 +1798,10 @@
+     // do bounds checks for the mask?
+     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+ 
+-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
++    snprintf(base, 256, "kernel_%s_%s%s_dk%d_dv%d",
+             "flash_attn_ext",
+             type,
++            !use_kv_f16 && ggml_metal_op_flash_attn_ext_p32(op) ? "_p32" : "", // julia1 patch P2
+             dk,
+             dv);
+ 
+diff -ru a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -135,7 +135,7 @@
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op, int epi); // julia1 patch P6-P9: epi = MM_EPI_* bits
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
+@@ -193,6 +193,10 @@
+         const struct ggml_tensor * op,
+         int32_t nqptg,
+         int32_t ncpsg);
++
++// julia1 patch P2: the non-vec flash attention kernel stages Q as float (exact) for F32 K/V with dk = dv = 64 when the op
++// asks for GGML_PREC_F32 (ggml_prec_set_acc); the vec kernel (n_q < 20) still stages Q as half
++bool ggml_metal_op_flash_attn_ext_p32(const struct ggml_tensor * op);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
+         ggml_metal_library_t lib,
+diff -ru a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -1,6 +1,7 @@
+ #include "ggml-metal-fusion.h"
+ 
+ #include "ggml-backend-impl.h"
++#include "ggml-metal-common.h"
+ #include "ggml-metal-device.h"
+ 
+ #include <algorithm>
+@@ -620,6 +621,204 @@
+     return true;
+ }
+ 
++// julia1 patch P6-P9: the fused epilogues read and write float4 runs
++static bool ggml_metal_fusion_aligned(const ggml_tensor * t, ggml_metal_fusion_mode mode) {
++    return mode != GGML_METAL_FUSION_FULL || ((uintptr_t) t->data) % 16 == 0;
++}
++
++// julia1 patch P6-P9: the fused kernel reads the activations (src1 of the MUL_MAT) until its last threadgroup finishes,
++// so a tensor it writes must not overlap them. The generic memory-range check lets a source that starts at the output's
++// address through (the write-through case of other fusions), so this is checked here, in FULL mode.
++static bool ggml_metal_fusion_mul_mat_writes_ok(const ggml_tensor * mm, const ggml_tensor * out, ggml_metal_fusion_mode mode) {
++    const ggml_tensor * x = mm->src[1];
++    if (mode != GGML_METAL_FUSION_FULL) {
++        return true;
++    }
++
++    ggml_backend_buffer_t bx = x->view_src ? x->view_src->buffer : x->buffer;
++    ggml_backend_buffer_t bo = out->view_src ? out->view_src->buffer : out->buffer;
++    if (bx != bo) {
++        return true;
++    }
++
++    const char * x0 = (const char *) x->data;
++    const char * o0 = (const char *) out->data;
++
++    return x0 + ggml_nbytes(x) <= o0 || o0 + ggml_nbytes(out) <= x0;
++}
++
++// julia1 patch P6-P9: a MUL_MAT whose output only feeds the fused node, and that ggml_metal_op_mul_mat runs on the legacy
++// simdgroup kernel_mul_mm (F32/F16 weights, more than 8 F32 columns, 2-D, no output bounds checks), the only kernel
++// with the fused epilogues. FULL mode also checks the device (no Metal-4 tensor API, simdgroup matrices).
++static bool ggml_metal_fusion_check_mul_mat_epi(const ggml_tensor * mm, ggml_metal_fusion_mode mode) {
++    const ggml_tensor * w = mm->src[0];
++    const ggml_tensor * x = mm->src[1];
++
++    if (mm->op != GGML_OP_MUL_MAT || ggml_metal_op_mul_mat_use_fwht(mm) ||
++        (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
++        ggml_is_transposed(w) || ggml_is_transposed(x) || w->ne[0] < 64 || x->ne[1] <= 8 ||
++        x->ne[2] != 1 || x->ne[3] != 1 || mm->ne[0] % 64 != 0 || mm->ne[1] % 32 != 0) {
++        return false;
++    }
++
++    if (mode == GGML_METAL_FUSION_FULL) {
++        ggml_backend_buffer_t buf = mm->view_src ? mm->view_src->buffer : mm->buffer;
++        if (!buf || !buf->buft || !buf->buft->device) {
++            return false;
++        }
++
++        const ggml_metal_device_props * props = ggml_metal_device_get_props((ggml_metal_device_t) buf->buft->device->context);
++        if (props->has_tensor || !props->has_simdgroup_mm) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++// julia1 patch P6: MUL_MAT + ADD, the other addend (the residual) has the layout of the output
++static bool ggml_metal_fusion_check_mul_mat_add(
++        const ggml_metal_fusion      * fusion,
++        const ggml_tensor * const    * nodes,
++        const ggml_cgraph            * gf,
++        const int                    * node_idxs,
++              int                      idx,
++              ggml_metal_fusion_mode   mode) {
++    GGML_UNUSED(fusion);
++    GGML_UNUSED(gf);
++    GGML_UNUSED(node_idxs);
++    GGML_UNUSED(idx);
++
++    const ggml_tensor * mm  = nodes[0];
++    const ggml_tensor * add = nodes[1];
++    const ggml_tensor * res = add->src[0] == mm ? add->src[1] : add->src[0];
++
++    return ggml_metal_fusion_check_mul_mat_epi(mm, mode) && res != mm && res->type == GGML_TYPE_F32 &&
++           add->type == GGML_TYPE_F32 && ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_are_same_shape(res, add) &&
++           ggml_metal_fusion_aligned(res, mode) && ggml_metal_fusion_aligned(add, mode) &&
++           ggml_metal_fusion_mul_mat_writes_ok(mm, add, mode);
++}
++
++// julia1 patch P7: MUL_MAT + GLU (geglu_erf of the first half by the second half of the MUL_MAT output rows)
++static bool ggml_metal_fusion_check_mul_mat_geglu(
++        const ggml_metal_fusion      * fusion,
++        const ggml_tensor * const    * nodes,
++        const ggml_cgraph            * gf,
++        const int                    * node_idxs,
++              int                      idx,
++              ggml_metal_fusion_mode   mode) {
++    const ggml_tensor * mm  = nodes[0];
++    const ggml_tensor * glu = nodes[1];
++
++    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU_ERF || glu->src[0] != mm || glu->src[1] ||
++        ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
++        glu->ne[0] != mm->ne[0]/2 || glu->ne[1] != mm->ne[1] || !ggml_metal_fusion_check_mul_mat_epi(mm, mode) ||
++        !ggml_metal_fusion_aligned(glu, mode) || !ggml_metal_fusion_mul_mat_writes_ok(mm, glu, mode)) {
++        return false;
++    }
++
++    const int outputs[1] = { node_idxs[idx + 1] };
++
++    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 2, fusion->ops.data(), outputs, 1);
++}
++
++// julia1 patch P8: MUL_MAT + ADD (bias vector) [+ ADD (residual, the layout of the output) | UNARY (relu)]
++static bool ggml_metal_fusion_check_mul_mat_bias(
++        const ggml_metal_fusion      * fusion,
++        const ggml_tensor * const    * nodes,
++        const ggml_cgraph            * gf,
++        const int                    * node_idxs,
++              int                      idx,
++              ggml_metal_fusion_mode   mode) {
++    GGML_UNUSED(gf);
++    GGML_UNUSED(node_idxs);
++    GGML_UNUSED(idx);
++
++    const ggml_tensor * mm   = nodes[0];
++    const ggml_tensor * add  = nodes[1];
++    const ggml_tensor * bias = add->src[1];
++
++    if (!ggml_metal_fusion_check_mul_mat_epi(mm, mode) || add->src[0] != mm || add->type != GGML_TYPE_F32 ||
++        bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || bias->ne[0] != mm->ne[0] || ggml_nrows(bias) != 1 ||
++        !ggml_metal_fusion_aligned(bias, mode)) {
++        return false;
++    }
++
++    if (fusion->ops.size() == 3) {
++        const ggml_tensor * out = nodes[2];
++        if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || !ggml_metal_fusion_aligned(out, mode) ||
++            !ggml_metal_fusion_mul_mat_writes_ok(mm, out, mode)) {
++            return false;
++        }
++        if (out->op == GGML_OP_ADD) {
++            const ggml_tensor * res = out->src[0] == add ? out->src[1] : out->src[0];
++            return res != add && res->type == GGML_TYPE_F32 && ggml_is_contiguous(res) && ggml_are_same_shape(res, out) &&
++                   ggml_metal_fusion_aligned(res, mode);
++        }
++        return ggml_get_unary_op(out) == GGML_UNARY_OP_RELU;
++    }
++
++    return ggml_is_contiguous(add) && ggml_metal_fusion_aligned(add, mode) && ggml_metal_fusion_mul_mat_writes_ok(mm, add, mode);
++}
++
++// julia1 patch P9: MUL_MAT + ROPE of a view of its first rows as heads of 64 (neox, positions only). The fused kernel
++// still writes the whole MUL_MAT output (other views of it, e.g. V, read it) and the rotated rows into the ROPE output.
++static bool ggml_metal_fusion_check_mul_mat_rope(
++        const ggml_metal_fusion      * fusion,
++        const ggml_tensor * const    * nodes,
++        const ggml_cgraph            * gf,
++        const int                    * node_idxs,
++              int                      idx,
++              ggml_metal_fusion_mode   mode) {
++    const ggml_tensor * mm   = nodes[0];
++    const ggml_tensor * rope = nodes[1];
++    const ggml_tensor * v    = rope->src[0];
++    const ggml_tensor * pos  = rope->src[1];
++
++    if (rope->op != GGML_OP_ROPE || !ggml_metal_fusion_check_mul_mat_epi(mm, mode)) {
++        return false;
++    }
++
++    const int32_t * params = (const int32_t *) rope->op_params;
++    float freq_scale, ext_factor, attn_factor;
++    memcpy(&freq_scale,  params + 6, sizeof(float));
++    memcpy(&ext_factor,  params + 7, sizeof(float));
++    memcpy(&attn_factor, params + 8, sizeof(float));
++
++    if (params[2] != GGML_ROPE_TYPE_NEOX || params[1] != 64 || params[15] != 0 || freq_scale != 1.0f || ext_factor != 0.0f ||
++        attn_factor != 1.0f || rope->src[2] || rope->type != GGML_TYPE_F32 || !ggml_is_contiguous(rope) ||
++        rope->data == mm->data || !ggml_metal_fusion_aligned(rope, mode) || !ggml_metal_fusion_mul_mat_writes_ok(mm, rope, mode) ||
++        !ggml_metal_fusion_mul_mat_writes_ok(mm, mm, mode)) {
++        return false;
++    }
++
++    // v: the first ne[1]*64 rows of each MUL_MAT column as [64, heads, n, sequences]
++    if (v->op != GGML_OP_VIEW || v->view_src != mm || v->view_offs != 0 || v->type != GGML_TYPE_F32 || v->ne[0] != 64 ||
++        v->nb[1] != 64*sizeof(float) || v->ne[1]*64 > mm->ne[0] || v->nb[2] != mm->nb[1] ||
++        v->nb[3] != v->ne[2]*mm->nb[1] || v->ne[2]*v->ne[3] != mm->ne[1]) {
++        return false;
++    }
++
++    // v is one of the (empty) nodes between the two and only the ROPE reads it
++    int vi = -1;
++    for (int i = node_idxs[idx] + 1; i < node_idxs[idx + 1]; i++) {
++        if (gf->nodes[i] == v) {
++            vi = i;
++        }
++    }
++    if (vi < 0 || ggml_node_get_use_count(gf, vi) != 1) {
++        return false;
++    }
++
++    if (pos->type != GGML_TYPE_I32 || pos->ne[0] < v->ne[2]) {
++        return false;
++    }
++
++    const int outputs[2] = { node_idxs[idx], node_idxs[idx + 1] };
++
++    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 2, fusion->ops.data(), outputs, 2);
++}
++
+ // ---- patterns ------------------------------------------------------------
+ 
+ static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
+@@ -641,6 +840,12 @@
+ 
+ static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+ 
++static const std::vector<ggml_op> ops_mul_mat_add   = { GGML_OP_MUL_MAT, GGML_OP_ADD }; // julia1 patch P6
++static const std::vector<ggml_op> ops_mul_mat_geglu = { GGML_OP_MUL_MAT, GGML_OP_GLU }; // julia1 patch P7
++static const std::vector<ggml_op> ops_mul_mat_bias_add  = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD };   // julia1 patch P8
++static const std::vector<ggml_op> ops_mul_mat_bias_relu = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY }; // julia1 patch P8
++static const std::vector<ggml_op> ops_mul_mat_rope = { GGML_OP_MUL_MAT, GGML_OP_VIEW, GGML_OP_ROPE };      // julia1 patch P9
++
+ static const std::vector<ggml_op> ops_moe_reduce_2 = {
+     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
+ };
+@@ -696,6 +901,12 @@
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
++    { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
++    { GGML_METAL_FUSION_MUL_MAT_GEGLU,  ops_mul_mat_geglu,          {},     true,  ggml_metal_fusion_check_mul_mat_geglu },
++    { GGML_METAL_FUSION_MUL_MAT_BIAS,   ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_bias },
++    { GGML_METAL_FUSION_MUL_MAT_BIAS,   ops_mul_mat_bias_add,       {},     false, ggml_metal_fusion_check_mul_mat_bias },
++    { GGML_METAL_FUSION_MUL_MAT_BIAS,   ops_mul_mat_bias_relu,      {},     false, ggml_metal_fusion_check_mul_mat_bias },
++    { GGML_METAL_FUSION_MUL_MAT_ROPE,   ops_mul_mat_rope,           {0},    true,  ggml_metal_fusion_check_mul_mat_rope },
+ };
+ 
+ // ---- alloc deps -----------------------------------------------------------
+diff -ru a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -39,6 +39,10 @@
+     GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
+     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
+     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
++    GGML_METAL_FUSION_MUL_MAT_ADD,   // julia1 patch P6: MUL_MAT + ADD (residual) in the GEMM epilogue
++    GGML_METAL_FUSION_MUL_MAT_GEGLU, // julia1 patch P7: MUL_MAT + GLU (geglu_erf, one source) in the GEMM epilogue
++    GGML_METAL_FUSION_MUL_MAT_BIAS,  // julia1 patch P8: MUL_MAT + ADD (bias) [+ ADD (residual) | UNARY (relu)] in the GEMM epilogue
++    GGML_METAL_FUSION_MUL_MAT_ROPE,  // julia1 patch P9: MUL_MAT + VIEW + ROPE (neox, heads of 64) in the GEMM epilogue
+ } ggml_metal_fusion_id;
+ 
+ struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
+diff -ru a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -16,6 +16,14 @@
+ 
+ #define N_MM_NPART_AMAX 256
+ 
++// julia1 patch P6-P9: fused epilogues of the legacy kernel_mul_mm (function constant FC_MUL_MM + 7, a bit mask), applied
++// in this order: BIAS, RELU, RES
++#define MM_EPI_RES   1  // dst = src2 + acc (the residual: F32, same layout as dst)
++#define MM_EPI_GEGLU 2  // dst[c] = gelu_erf(acc[c]) * acc[c + ne0/2]: each 64-row tile of src0 holds 32 channels of both halves
++#define MM_EPI_BIAS  4  // acc + src3[row] (F32 bias vector)
++#define MM_EPI_RELU  8  // fmax(0, acc)
++#define MM_EPI_ROPE  16 // dst = acc, and rows < rope_rows (heads of 64) NEOX-rotated into dst2 ([rope_rows, ne1]; positions src3)
++
+ // kernel parameters for mat-vec threadgroups
+ //
+ // N_R0: number of src0 rows to process per simdgroup
+@@ -390,6 +398,8 @@
+     uint64_t nb31;
+     uint64_t nb32;
+     uint64_t nb33;
++    uint64_t nk1; // julia1 patch P11: bytes of a K row the attention kernels read (<= nb11)
++    uint64_t nv1; // julia1 patch P11: bytes of a V row the attention kernels read (<= nb21)
+ } ggml_metal_kargs_flash_attn_ext_pad;
+ 
+ typedef struct {
+@@ -505,6 +515,14 @@
+     int32_t  ne1;
+     int16_t  r2;
+     int16_t  r3;
++    int32_t  rope_n;         // julia1 patch P9 (MM_EPI_ROPE): tokens per sequence (the position of column t is src3[t % rope_n])
++    int32_t  rope_rows;      //   rotated rows (a multiple of 64)
++    int32_t  rope_n_dims;    //   = 64
++    float    rope_freq_base;   //   the ROPE parameters, passed as in kernel_rope_neox
++    float    rope_freq_scale;
++    float    rope_ext_factor;
++    float    rope_attn_factor;
++    float    rope_freq_factor; //   = 1 (no frequency factors)
+ } ggml_metal_kargs_mul_mm;
+ 
+ typedef struct {
+diff -ru a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2424,6 +2424,62 @@
+     }
+     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+ 
++    // julia1 patch P6-P9: the nodes fused after this op (a residual ADD, GEGLU, bias ADD [+ residual ADD | RELU], or a
++    // ROPE of its first rows) run in the epilogue of kernel_mul_mm, which writes the last fused node's output (ROPE: also
++    // this op's output). The fusion checks guarantee that this op takes the kernel_mul_mm branch below.
++    int n_fuse = 1;
++    int epi = 0;
++    const ggml_tensor * dst  = op;
++    const ggml_tensor * res  = nullptr; // src2: residual
++    const ggml_tensor * aux  = nullptr; // src3: bias or positions
++    const ggml_tensor * dst2 = nullptr; // rotated rows
++    int32_t rope_n = 0, rope_rows = 0, rope_n_dims = 0;
++    float rope_freq_base = 0.0f, rope_freq_scale = 0.0f, rope_ext_factor = 0.0f, rope_attn_factor = 0.0f;
++
++    if (ctx->use_fusion()) {
++        int n = 1;
++        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
++        const ggml_metal_fusion_id id = fusion ? ggml_metal_fusion_get_id(fusion) : GGML_METAL_FUSION_NONE;
++
++        if (id == GGML_METAL_FUSION_MUL_MAT_ADD || id == GGML_METAL_FUSION_MUL_MAT_GEGLU ||
++            id == GGML_METAL_FUSION_MUL_MAT_BIAS || id == GGML_METAL_FUSION_MUL_MAT_ROPE) {
++            n_fuse = n;
++            const ggml_tensor * last = ctx->node(idx + n - 1);
++            if (id == GGML_METAL_FUSION_MUL_MAT_ADD) {
++                epi = MM_EPI_RES;
++                dst = last;
++                res = last->src[0] == op ? last->src[1] : last->src[0];
++            } else if (id == GGML_METAL_FUSION_MUL_MAT_GEGLU) {
++                epi = MM_EPI_GEGLU;
++                dst = last;
++            } else if (id == GGML_METAL_FUSION_MUL_MAT_BIAS) {
++                const ggml_tensor * add = ctx->node(idx + 1);
++                epi = MM_EPI_BIAS;
++                dst = last;
++                aux = add->src[1];
++                if (n == 3 && last->op == GGML_OP_ADD) {
++                    epi |= MM_EPI_RES;
++                    res = last->src[0] == add ? last->src[1] : last->src[0];
++                } else if (n == 3) {
++                    epi |= MM_EPI_RELU;
++                }
++            } else {
++                const ggml_tensor * v = last->src[0];
++                epi = MM_EPI_ROPE;
++                aux = last->src[1];
++                dst2 = last;
++                rope_n = v->ne[2];
++                rope_rows = v->ne[0]*v->ne[1];
++                rope_n_dims = ((const int32_t *) last->op_params)[1];
++                memcpy(&rope_freq_base,   (const int32_t *) last->op_params + 5, sizeof(float));
++                memcpy(&rope_freq_scale,  (const int32_t *) last->op_params + 6, sizeof(float));
++                memcpy(&rope_ext_factor,  (const int32_t *) last->op_params + 7, sizeof(float));
++                memcpy(&rope_attn_factor, (const int32_t *) last->op_params + 8, sizeof(float));
++            }
++            ctx->count_fusions(fusion);
++        }
++    }
++
+     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+@@ -2511,6 +2567,8 @@
+                 GGML_ABORT("unsupported ne11");
+         };
+ 
++        GGML_ASSERT(epi == 0);
++
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
+ 
+         ggml_metal_kargs_mul_mv_ext args = {
+@@ -2553,7 +2611,7 @@
+         //    default: break;
+         //}
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
++        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, epi);
+ 
+         ggml_metal_kargs_mul_mm args = {
+             /*.ne00 =*/ ne00,
+@@ -2570,13 +2628,25 @@
+             /*.ne1  =*/ ne1,
+             /*.r2   =*/ r2,
+             /*.r3   =*/ r3,
++            /*.rope_n         =*/ rope_n,
++            /*.rope_rows      =*/ rope_rows,
++            /*.rope_n_dims    =*/ rope_n_dims,
++            /*.rope_freq_base   =*/ rope_freq_base,
++            /*.rope_freq_scale  =*/ rope_freq_scale,
++            /*.rope_ext_factor  =*/ rope_ext_factor,
++            /*.rope_attn_factor =*/ rope_attn_factor,
++            /*.rope_freq_factor =*/ 1.0f,
+         };
+ 
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
++        // julia1 patch P6-P9: epilogue operands (bound to dst when unused)
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res  ? res  : dst), 4);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(aux  ? aux  : dst), 5);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst2 ? dst2 : dst), 6);
+ 
+         const size_t smem = pipeline.smem;
+ 
+@@ -2588,6 +2658,8 @@
+ 
+         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+     } else {
++        GGML_ASSERT(epi == 0);
++
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+ 
+         const int nr0 = pipeline.nr0;
+@@ -2636,7 +2708,7 @@
+         }
+     }
+ 
+-    return 1;
++    return n_fuse;
+ }
+ 
+ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
+@@ -3408,6 +3480,10 @@
+         }
+     }
+ 
++    // julia1 patch P11: bytes of a K / V row that the attention kernels read (the kvpad pre-pass copies only these)
++    const uint64_t nk1_attn = use_kv_f16 ? ne10*sizeof(ggml_fp16_t) : ggml_row_size(op->src[1]->type, ne10);
++    const uint64_t nv1_attn = use_kv_f16 ? ne20*sizeof(ggml_fp16_t) : ggml_row_size(op->src[2]->type, ne20);
++
+     if (!use_sparse && !ggml_metal_op_flash_attn_ext_use_vec(op)) {
+         // half8x8 kernel
+         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
+@@ -3440,6 +3516,8 @@
+                 /*.nb31    =*/nb31,
+                 /*.nb32    =*/nb32,
+                 /*.nb33    =*/nb33,
++                /*.nk1     =*/std::min<uint64_t>(nb11_attn, nk1_attn),
++                /*.nv1     =*/std::min<uint64_t>(nb21_attn, nv1_attn),
+             };
+ 
+             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
+@@ -3501,7 +3579,9 @@
+         // the shared memory needed for the simdgroups to load the KV cache
+         // each thread loads (dequantizes) 16 head elements, there are 32 threads in th SG
+         //
+-#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
++        // julia1 patch P2: a float-staged Q takes 2*ne00 halves per query
++        const int64_t q_halves = !use_kv_f16 && ggml_metal_op_flash_attn_ext_p32(op) ? 2*ne00 : ne00;
++#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(q_halves + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
+ 
+         //int64_t nsgmax = 4;
+         //
+@@ -3653,6 +3733,8 @@
+                 /*.nb31    =*/nb31,
+                 /*.nb32    =*/nb32,
+                 /*.nb33    =*/nb33,
++                /*.nk1     =*/std::min<uint64_t>(nb11_attn, nk1_attn),
++                /*.nv1     =*/std::min<uint64_t>(nb21_attn, nv1_attn),
+             };
+ 
+             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
+diff -ru a/ggml/src/ggml-metal/kernels/fa.metal b/ggml/src/ggml-metal/kernels/fa.metal
+--- a/ggml/src/ggml-metal/kernels/fa.metal
++++ b/ggml/src/ggml-metal/kernels/fa.metal
+@@ -82,19 +82,21 @@
+         device char * k_dst = k_pad + args.nb11*i1 + args.nb11*C*i2 + args.nb11*C*args.ne_12_2*i3;
+         device char * v_dst = v_pad + args.nb21*i1 + args.nb21*C*i2 + args.nb21*C*args.ne_12_2*i3;
+ 
++        // julia1 patch P11: only the row payload (nk1/nv1 bytes, instead of the row stride nb11/nb21): with K/V viewed out
++        // of a wider tensor (e.g. the heads of a fused qkv) the stride spans every head
+         if (i1 >= icp) {
+             // here it is not important the exact value that will be used as we rely on masking out the scores in the attention
+-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
++            for (uint64_t i = tiitg; i < args.nk1; i += ntg.x) {
+                 k_dst[i] = 0;
+             }
+-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
++            for (uint64_t i = tiitg; i < args.nv1; i += ntg.x) {
+                 v_dst[i] = 0;
+             }
+         } else {
+-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
++            for (uint64_t i = tiitg; i < args.nk1; i += ntg.x) {
+                 k_dst[i] = k_src[i];
+             }
+-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
++            for (uint64_t i = tiitg; i < args.nv1; i += ntg.x) {
+                 v_dst[i] = v_src[i];
+             }
+         }
+@@ -146,6 +148,25 @@
+ 
+     device const half * mask_src = (device const half *) (mask + (i1*Q)*args.nb31 + i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
+ 
++    // julia1 patch P11: the partial last KV block (n_kv % C != 0; the attention reads it through the kvpad buffer, whose
++    // extra columns are masked) is classed by its valid columns, so that it is skipped like a full block when every one
++    // of them is -INF (e.g. the sliding-window rows far from the end); it is never "all zero" (2)
++    if ((C > NW || Q > 1) && i0*C + C > args.ne30 && i1*Q + Q <= args.ne31) {
++        half mmax = -MAXHALF;
++
++        FOR_UNROLL (short j = 0; j < Q; ++j) {
++            FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
++                if (i0*C + ii*NW + tiisg < args.ne30) {
++                    mmax = max(mmax, mask_src[ii*NW]);
++                }
++            }
++
++            mask_src += args.nb31/2;
++        }
++
++        res = simd_max(mmax) > -MAXHALF ? 1 : 0;
++    }
++
+     // detailed check of the elements of the block
+     if ((C > NW || Q > 1) && res == 0) {
+         half mmin =  MAXHALF;
+@@ -273,12 +294,13 @@
+     constexpr short SH  = 2*C; // shared memory per simdgroup (s_t == float)
+ 
+     constexpr short TS = 2*SH;
+-    constexpr short T  = DK + 2*PV; // shared memory size per query in (half)
++    constexpr short QH = DK*sizeof(q_t)/sizeof(half); // julia1 patch P2: query size in half units (was DK: q_t = half)
++    constexpr short T  = QH + 2*PV; // shared memory size per query in (half)
+ 
+     threadgroup q_t  * sq  = (threadgroup q_t  *) (shmem_f16 + 0*T); // holds the query data
+     threadgroup q4_t * sq4 = (threadgroup q4_t *) (shmem_f16 + 0*T); // same as above but in q4_t
+-    threadgroup o_t  * so  = (threadgroup o_t  *) (shmem_f16 + 0*T + Q*DK); // the result for all queries in 8x8 matrices (the O matrix from the paper)
+-    threadgroup o4_t * so4 = (threadgroup o4_t *) (shmem_f16 + 0*T + Q*DK);
++    threadgroup o_t  * so  = (threadgroup o_t  *) (shmem_f16 + 0*T + Q*QH); // the result for all queries in 8x8 matrices (the O matrix from the paper)
++    threadgroup o4_t * so4 = (threadgroup o4_t *) (shmem_f16 + 0*T + Q*QH);
+     threadgroup s_t  * ss  = (threadgroup s_t  *) (shmem_f16 + Q*T); // scratch buffer for attention, mask and diagonal matrix
+     threadgroup s2_t * ss2 = (threadgroup s2_t *) (shmem_f16 + Q*T); // same as above but in s2_t
+ 
+@@ -927,6 +949,15 @@
+ template [[host_name("kernel_flash_attn_ext_f32_dk40_dv40"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  40,  40>;
+ template [[host_name("kernel_flash_attn_ext_f32_dk48_dv48"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  48,  48>;
+ template [[host_name("kernel_flash_attn_ext_f32_dk64_dv64"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  64,  64>;
++// julia1 patch P2: exact variant (selected by ggml_prec_set_acc(fa, GGML_PREC_F32) with F32 K/V): Q staged as float
++#define FA_TYPES_F32_P32 \
++    float,  float4,    simdgroup_float8x8, \
++    float,  float4x4,  simdgroup_float8x8, \
++    float,  float4x4,  simdgroup_float8x8, \
++    float,             simdgroup_float8x8, \
++    float,  float2,    simdgroup_float8x8, \
++    float,  float4,    simdgroup_float8x8
++template [[host_name("kernel_flash_attn_ext_f32_p32_dk64_dv64")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32_P32, float4x4, 1, dequantize_f32, float4x4, 1, dequantize_f32, 64, 64>;
+ template [[host_name("kernel_flash_attn_ext_f32_dk72_dv72"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  72,  72>;
+ template [[host_name("kernel_flash_attn_ext_f32_dk80_dv80"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  80,  80>;
+ template [[host_name("kernel_flash_attn_ext_f32_dk96_dv96"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_F32, float4x4,   1, dequantize_f32,  float4x4,   1, dequantize_f32,  96,  96>;
+diff -ru a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -8,7 +8,30 @@
+ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
+ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+ constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
++constant short FC_mul_mm_epi  [[function_constant(FC_MUL_MM + 7)]]; // julia1 patch P6-P9: MM_EPI_* bits
+ 
++// julia1 patch P9: copies of rope_yarn_ramp and rope_yarn from rope.metal (FC_rope_is_back = false) for the fused RoPE
++// epilogue. Keep them verbatim: with the (runtime) ext_factor branch the compiler emits the same cos/sin code as for
++// kernel_rope_neox; without it the rotated values differ in the last bits.
++static float julia1_rope_yarn_ramp(const float low, const float high, const int i0) {
++    const float y = (i0 / 2 - low) / max(0.001f, high - low);
++    return 1.0f - min(1.0f, max(0.0f, y));
++}
++
++static void julia1_rope_yarn(
++    float theta_extrap, float freq_scale, float corr_dims[2], int i0, float ext_factor, float mscale,
++    thread float * cos_theta, thread float * sin_theta) {
++    float theta_interp = freq_scale * theta_extrap;
++    float theta = theta_interp;
++    if (ext_factor != 0.0f) {
++        float ramp_mix = julia1_rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;
++        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
++        mscale *= 1.0f + 0.1f * log(1.0f / freq_scale);
++    }
++    *cos_theta = cos(theta) * mscale;
++    *sin_theta = sin(theta) * mscale;
++}
++
+ // each block_q contains 16*nl weights
+ #ifdef GGML_METAL_HAS_TENSOR
+ template<
+@@ -153,13 +176,16 @@
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
++        device const char * src2, // julia1 patch P6: the residual (MM_EPI_RES)
++        device const char * src3, // julia1 patch P8/P9: the bias (MM_EPI_BIAS) or the positions (MM_EPI_ROPE)
++        device       char * dst2, // julia1 patch P9: the rotated rows (MM_EPI_ROPE)
+         threadgroup  char * shmem [[threadgroup(0)]],
+         uint3  tgpig[[threadgroup_position_in_grid]],
+         ushort tiitg[[thread_index_in_threadgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+ 
+     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
++    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 64*32*sizeof(S0)); // julia1 patch P1: was shmem + 4096 (S0 = half)
+ 
+     constexpr int NR0 = 64;
+     constexpr int NR1 = 32;
+@@ -190,8 +216,12 @@
+     const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+     const short    offset1 = il0/nl;
+ 
+-    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
++    // julia1 patch P7 (MM_EPI_GEGLU): tile tgpig.y computes the channels 32*tgpig.y + 0..31 of both halves of src0:
++    // rows 0..31 of the tile are those channels of the gelu branch (first half), rows 32..63 the same channels of the gate
++    const int ra = (FC_mul_mm_epi & MM_EPI_GEGLU) ? (lr0/32)*(args.ne0/2) + 32*tgpig.y + lr0%32 : r0 + lr0;
+ 
++    device const block_q * x = (device const block_q *)(src0 + args.nb01*ra + offset0) + offset1;
++
+     const short iy = 8*(tiitg % NL1);
+ 
+     device const T1 * y = (device const T1 *)(src1
+@@ -315,7 +345,104 @@
+         }
+     }
+ 
+-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
++    if (FC_mul_mm_epi != 0) {
++        // julia1 patch P6-P9: fused epilogue. The 64x32 result tile is staged in threadgroup memory (as for the bounds
++        // checked store below), then every thread applies the epilogue to runs of 4 rows and writes them. The host takes
++        // this path only without output bounds checks.
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
++
++        for (short i = 0; i < 8; i++) {
++            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        threadgroup const float4 * T4 = (threadgroup const float4 *) shmem; // [NR1 tokens][NR0/4 row runs]
++
++        if (FC_mul_mm_epi & MM_EPI_GEGLU) {
++            // dst[c] = gelu_erf(gelu branch) * gate, as kernel_geglu_erf; dst has ne0/2 rows
++            const int ne0g = args.ne0/2;
++
++            for (int e = tiitg; e < NR1*8; e += 128) {
++                const int j  = e/8;
++                const int c4 = e%8;
++
++                const float4 g = T4[j*(NR0/4) + c4];
++                const float4 u = T4[j*(NR0/4) + 8 + c4];
++
++                float4 o;
++                for (short k = 0; k < 4; k++) {
++                    const float x0 = g[k];
++                    const float x1 = u[k];
++
++                    const float gelu_erf = 0.5f*x0*(1.0f+erf_approx<float>(x0*SQRT_2_INV));
++
++                    o[k] = gelu_erf*x1;
++                }
++
++                *((device float4 *) ((device float *) dst + r0/2 + 4*c4 + (r1 + j)*ne0g + im*args.ne1*ne0g)) = o;
++            }
++        } else {
++            // BIAS, RELU, RES in this order, as the unfused ADD(acc, bias), RELU and ADD(residual, .); ROPE stores acc
++            for (int e = tiitg; e < NR1*(NR0/4); e += 128) {
++                const int j  = e/(NR0/4);
++                const int r4 = e%(NR0/4);
++
++                const int64_t off = r0 + 4*r4 + (int64_t)(r1 + j)*args.ne0 + (int64_t) im*args.ne1*args.ne0;
++
++                float4 v = T4[j*(NR0/4) + r4];
++
++                if (FC_mul_mm_epi & MM_EPI_BIAS) {
++                    v = v + *((device const float4 *) ((device const float *) src3 + r0 + 4*r4));
++                }
++                if (FC_mul_mm_epi & MM_EPI_RELU) {
++                    v = fmax(0, v);
++                }
++                if (FC_mul_mm_epi & MM_EPI_RES) {
++                    v = *((device const float4 *) ((device const float *) src2 + off)) + v;
++                }
++
++                *((device float4 *) ((device float *) dst + off)) = v;
++            }
++
++            if ((FC_mul_mm_epi & MM_EPI_ROPE) && r0 < args.rope_rows) {
++                // julia1 patch P9: this tile is one head (64 rows) of the rotated rows: NEOX rotation of the pairs
++                // (ic, ic + 32) into dst2, computed as kernel_rope_neox (the host checks: ext_factor 0, freq_scale 1,
++                // attn_factor 1, no frequency factors)
++                threadgroup const float * T = (threadgroup const float *) shmem;
++
++                device const int32_t * pos = (device const int32_t *) src3;
++
++                const float inv_ndims = -1.f/args.rope_n_dims;
++
++                for (int e = tiitg; e < NR1*(NR0/2); e += 128) {
++                    const int j  = e/(NR0/2);
++                    const int ic = e%(NR0/2);
++                    const int t  = r1 + j;
++
++                    const float theta_base = (float) pos[t % args.rope_n];
++                    const float theta = theta_base * pow(args.rope_freq_base, inv_ndims*(2*ic));
++
++                    float cos_theta;
++                    float sin_theta;
++                    float corr_dims[2] = { 0.0f, 0.0f }; // only used when ext_factor != 0
++
++                    julia1_rope_yarn(theta/args.rope_freq_factor, args.rope_freq_scale, corr_dims, 2*ic, args.rope_ext_factor,
++                                    args.rope_attn_factor, &cos_theta, &sin_theta);
++
++                    const float x0 = T[j*NR0 + ic];
++                    const float x1 = T[j*NR0 + ic + NR0/2];
++
++                    device float * d = (device float *) dst2 + r0 + ic + (int64_t) t*args.rope_rows;
++
++                    d[0]      = x0*cos_theta - x1*sin_theta;
++                    d[NR0/2]  = x0*sin_theta + x1*cos_theta;
++                }
++            }
++        }
++    } else if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+         // if no bounds checks on the output are needed, we can directly write to device memory
+         device float * C = (device float *) dst +
+             (r0 + 32*(sgitg &  1)) + \
+@@ -358,6 +485,244 @@
+     }
+ }
+ 
++// julia1 patch P10: kernel_mul_mm with a smaller tile, for F32/F16 weights and F32 activations: 2x2 simdgroups, each
++// computing BR x BC blocks of 8x8, i.e. a tile of NR0 = 16*BR rows of src0 by NR1 = 16*BC columns of src1 (kernel_mul_mm:
++// BR = 4, BC = 2), K in steps of 32. PF: register prefetch of the next K step. No bounds checks: the host selects it only
++// when ne00 % 32, ne0 % NR0 and ne1 % NR1 are 0. Threadgroup memory holds the tiles as in kernel_mul_mm (8x8 blocks, A
++// k-major, B column-major), and every output element accumulates the same 8-wide k blocks in the same ascending order
++// with the same operand types, so the results equal kernel_mul_mm's. The fused epilogues (P6-P9) are those of
++// kernel_mul_mm, generalized to the tile (ROPE needs NR0 % 64 == 0: whole heads per tile).
++template<
++    typename S0, typename S0_4x4, typename S0_8x8,
++    typename S1, typename S1_2x4, typename S1_8x8,
++    typename T0_4x4, short BR, short BC, bool PF>
++kernel void kernel_mul_mm_t(
++        constant ggml_metal_kargs_mul_mm & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        device const char * src2,
++        device const char * src3,
++        device       char * dst2,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++
++    constexpr short NK  = 32;
++    constexpr short NR0 = 16*BR;
++    constexpr short NR1 = 16*BC;
++    constexpr short NT  = 128; // threads
++    constexpr short LA  = 2*NR0; // loads of 16 k-values (one S0_4x4) per A tile
++    constexpr short LB  = 4*NR1; // loads of 8 k-values (one S1_2x4) per B tile
++    static_assert(LA <= NT && LB <= NT, "at most one A and one B load per thread and K step");
++
++    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
++    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*NK*sizeof(S0));
++
++    const int im = tgpig.z;
++    const int r0 = tgpig.y*NR0;
++    const int r1 = tgpig.x*NR1;
++
++    const int i12 = im % FC_mul_mm_ne12;
++    const int i13 = im / FC_mul_mm_ne12;
++
++    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
++
++    // thread tiitg loads k-values 16*(la%2) + 0..15 of the A tile row la/2 and 8*(lb%4) + 0..7 of the B tile column
++    // lb/4 (threads beyond LA / LB load the last ones again and store nothing)
++    const short la  = min((short) tiitg, (short) (LA - 1));
++    const short lb  = min((short) tiitg, (short) (LB - 1));
++    const short row = la/2;
++    const short col = lb/4;
++
++    // MM_EPI_GEGLU: tile tgpig.y holds the channels (NR0/2)*tgpig.y + 0..NR0/2-1 of both halves of src0
++    const int ra = (FC_mul_mm_epi & MM_EPI_GEGLU) ? (row/(NR0/2))*(args.ne0/2) + (NR0/2)*tgpig.y + row%(NR0/2) : r0 + row;
++
++    device const T0_4x4   * x = (device const T0_4x4 *)(src0 + args.nb01*ra + offset0) + la%2;
++    device const float2x4 * y = (device const float2x4 *)(src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(r1 + col) + args.nb10*8*(lb%4));
++
++    const short sgr = sgitg%2;
++    const short sgc = sgitg/2;
++
++    S0_8x8 ma[BR];
++    S1_8x8 mb[BC];
++
++    simdgroup_float8x8 mc[BR*BC];
++
++    FOR_UNROLL (short i = 0; i < BR*BC; i++) {
++        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
++    }
++
++    // PF: the next K step's A and B values are loaded into registers before the current step's products; otherwise right
++    // before they are stored, as kernel_mul_mm does
++    S0_4x4   temp_a;
++    float2x4 temp_b;
++
++    if (PF) {
++        temp_a = (S0_4x4)(*x); x += NK/16;
++        temp_b = *y;           y += NK/8;
++    }
++
++    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
++        if (!PF) {
++            temp_a = (S0_4x4)(*x); x += NK/16;
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        if (LA == NT || tiitg < LA) {
++            FOR_UNROLL (short i = 0; i < 16; i++) {
++                // 8x8 block (k block 2*(la%2) + i/8, row block row/8), k-major
++                *(sa + 64*((NR0/8)*(2*(la%2) + i/8) + row/8) + 8*(i%8) + row%8) = temp_a[i/4][i%4];
++            }
++        }
++
++        if (!PF) {
++            temp_b = *y; y += NK/8;
++        }
++
++        if (LB == NT || tiitg < LB) {
++            // 8x8 block (k block lb%4, column block col/8), column-major
++            *(threadgroup S1_2x4 *)(sb + 64*((NR1/8)*(lb%4) + col/8) + 8*(col%8)) = (S1_2x4)(temp_b);
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        if (PF && loop_k + NK < args.ne00) {
++            temp_a = (S0_4x4)(*x); x += NK/16;
++            temp_b = *y;           y += NK/8;
++        }
++
++        threadgroup const S0 * lsma = sa + 64*BR*sgr;
++        threadgroup const S1 * lsmb = sb + 64*BC*sgc;
++
++        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
++            simdgroup_barrier(mem_flags::mem_none);
++
++            FOR_UNROLL (short i = 0; i < BR; i++) {
++                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
++            }
++
++            simdgroup_barrier(mem_flags::mem_none);
++
++            FOR_UNROLL (short i = 0; i < BC; i++) {
++                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
++            }
++
++            simdgroup_barrier(mem_flags::mem_none);
++
++            FOR_UNROLL (short i = 0; i < BR*BC; i++) {
++                simdgroup_multiply_accumulate(mc[i], mb[i/BR], ma[i%BR], mc[i]);
++            }
++
++            lsma += 64*(NR0/8);
++            lsmb += 64*(NR1/8);
++        }
++    }
++
++    if (FC_mul_mm_epi == 0) {
++        device float * C = (device float *) dst + (r0 + 8*BR*sgr) + (r1 + 8*BC*sgc)*args.ne0 + im*args.ne1*args.ne0;
++
++        FOR_UNROLL (short i = 0; i < BR*BC; i++) {
++            simdgroup_store(mc[i], C + 8*(i%BR) + 8*args.ne0*(i/BR), args.ne0, 0, false);
++        }
++        return;
++    }
++
++    // fused epilogue: stage the NR1 x NR0 float tile in threadgroup memory, then apply the epilogue to runs of 4 rows
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    threadgroup float * temp_str = ((threadgroup float *) shmem) + 8*BR*sgr + 8*BC*sgc*NR0;
++
++    FOR_UNROLL (short i = 0; i < BR*BC; i++) {
++        simdgroup_store(mc[i], temp_str + 8*(i%BR) + 8*NR0*(i/BR), NR0, 0, false);
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    threadgroup const float4 * T4 = (threadgroup const float4 *) shmem; // [NR1 columns][NR0/4 row runs]
++
++    if (FC_mul_mm_epi & MM_EPI_GEGLU) {
++        const int ne0g = args.ne0/2;
++
++        for (int e = tiitg; e < NR1*(NR0/8); e += NT) {
++            const int j  = e/(NR0/8);
++            const int c4 = e%(NR0/8);
++
++            const float4 g = T4[j*(NR0/4) + c4];
++            const float4 u = T4[j*(NR0/4) + NR0/8 + c4];
++
++            float4 o;
++            for (short k = 0; k < 4; k++) {
++                const float x0 = g[k];
++                const float x1 = u[k];
++
++                const float gelu_erf = 0.5f*x0*(1.0f+erf_approx<float>(x0*SQRT_2_INV));
++
++                o[k] = gelu_erf*x1;
++            }
++
++            *((device float4 *) ((device float *) dst + r0/2 + 4*c4 + (r1 + j)*ne0g + im*args.ne1*ne0g)) = o;
++        }
++        return;
++    }
++
++    for (int e = tiitg; e < NR1*(NR0/4); e += NT) {
++        const int j  = e/(NR0/4);
++        const int r4 = e%(NR0/4);
++
++        const int64_t off = r0 + 4*r4 + (int64_t)(r1 + j)*args.ne0 + (int64_t) im*args.ne1*args.ne0;
++
++        float4 v = T4[j*(NR0/4) + r4];
++
++        if (FC_mul_mm_epi & MM_EPI_BIAS) {
++            v = v + *((device const float4 *) ((device const float *) src3 + r0 + 4*r4));
++        }
++        if (FC_mul_mm_epi & MM_EPI_RELU) {
++            v = fmax(0, v);
++        }
++        if (FC_mul_mm_epi & MM_EPI_RES) {
++            v = *((device const float4 *) ((device const float *) src2 + off)) + v;
++        }
++
++        *((device float4 *) ((device float *) dst + off)) = v;
++    }
++
++    if ((FC_mul_mm_epi & MM_EPI_ROPE) && r0 < args.rope_rows) {
++        threadgroup const float * T = (threadgroup const float *) shmem;
++
++        device const int32_t * pos = (device const int32_t *) src3;
++
++        const float inv_ndims = -1.f/args.rope_n_dims;
++
++        for (int e = tiitg; e < NR1*(NR0/2); e += NT) {
++            const int j  = e/(NR0/2);
++            const int h  = 64*((e%(NR0/2))/32); // first row of the head
++            const int ic = e%32;
++            const int t  = r1 + j;
++
++            const float theta_base = (float) pos[t % args.rope_n];
++            const float theta = theta_base * pow(args.rope_freq_base, inv_ndims*(2*ic));
++
++            float cos_theta;
++            float sin_theta;
++            float corr_dims[2] = { 0.0f, 0.0f }; // only used when ext_factor != 0
++
++            julia1_rope_yarn(theta/args.rope_freq_factor, args.rope_freq_scale, corr_dims, 2*ic, args.rope_ext_factor,
++                            args.rope_attn_factor, &cos_theta, &sin_theta);
++
++            const float x0 = T[j*NR0 + h + ic];
++            const float x1 = T[j*NR0 + h + ic + 32];
++
++            device float * d = (device float *) dst2 + r0 + h + ic + (int64_t) t*args.rope_rows;
++
++            d[0]  = x0*cos_theta - x1*sin_theta;
++            d[32] = x0*sin_theta + x1*cos_theta;
++        }
++    }
++}
++
+ #endif // GGML_METAL_HAS_TENSOR
+ 
+ template<short ne20> // n_expert_used
+@@ -852,6 +1217,29 @@
+ 
+ template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
+ template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
++// julia1 patch P1: exact variants (selected by ggml_prec_set_src(mm, GGML_PREC_F32, 1)): both operands staged in
++// threadgroup memory at their own precision (F32 weights as float, F16 weights as half, activations as float).
++// Legacy (non tensor-API) kernel only: the host never selects them when has_tensor is set.
++#ifndef GGML_METAL_HAS_TENSOR
++template [[host_name("kernel_mul_mm_f32_f32_p32")]] kernel mul_mm_t kernel_mul_mm<float,  float4x4,  simdgroup_float8x8,  float,  float2x4,  simdgroup_float8x8,  float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
++template [[host_name("kernel_mul_mm_f16_f32_p32")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   float,  float2x4,  simdgroup_float8x8,  half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
++// julia1 patch P10: the tiles of kernel_mul_mm_t that the host selects (ggml_metal_mm_tiles in ggml-metal-device.cpp),
++// for the weight/staging combinations of kernel_mul_mm_{f32,f16}_f32 above and of the P1 _p32 variants
++typedef decltype(kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 2, 1, true>) mul_mm_t_t;
++
++template [[host_name("kernel_mul_mm_f32_f32_t32x16_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 2, 1, true>;
++template [[host_name("kernel_mul_mm_f16_f32_t32x16_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 2, 1, true>;
++template [[host_name("kernel_mul_mm_f32_f32_p32_t32x16_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 2, 1, true>;
++template [[host_name("kernel_mul_mm_f16_f32_p32_t32x16_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, half4x4, 2, 1, true>;
++template [[host_name("kernel_mul_mm_f32_f32_t32x32_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 2, 2, true>;
++template [[host_name("kernel_mul_mm_f16_f32_t32x32_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 2, 2, true>;
++template [[host_name("kernel_mul_mm_f32_f32_p32_t32x32_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 2, 2, true>;
++template [[host_name("kernel_mul_mm_f16_f32_p32_t32x32_pf")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, half4x4, 2, 2, true>;
++template [[host_name("kernel_mul_mm_f32_f32_t48x32")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 3, 2, false>;
++template [[host_name("kernel_mul_mm_f16_f32_t48x32")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 3, 2, false>;
++template [[host_name("kernel_mul_mm_f32_f32_p32_t48x32")]] kernel mul_mm_t_t kernel_mul_mm_t<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 3, 2, false>;
++template [[host_name("kernel_mul_mm_f16_f32_p32_t48x32")]] kernel mul_mm_t_t kernel_mul_mm_t<half, half4x4, simdgroup_half8x8, float, float2x4, simdgroup_float8x8, half4x4, 3, 2, false>;
++#endif
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
+ #endif

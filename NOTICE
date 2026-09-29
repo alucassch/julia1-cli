@@ -1,0 +1,60 @@
+julia1-cli
+==========
+
+Copyright 2026 the julia1-cli authors.
+
+julia1-cli is a GGUF runtime for the Julia-1 decision model: a C++/ggml runtime (CLI, HTTP server, C API), a Python
+package (julia1-gguf), a converter from the upstream checkpoint to GGUF, and validation tools. The names julia1-cli,
+julia1-gguf and julia1 refer to the Julia-1 model, not to the Julia programming language. This is an independent
+port, not affiliated with or endorsed by Supersonic Labs.
+
+The source code in this repository is released under the Apache License 2.0 (see LICENSE). The changes to ggml in
+patches/ggml-julia1.patch are released under the MIT License, the license of ggml, so that they can be proposed
+upstream (license text in THIRD_PARTY_LICENSES, entry (1)).
+
+Model and data
+--------------
+
+* Julia-1: weights, decision head, typed decision API and reference code by Supersonic Labs
+  (https://huggingface.co/SupersonicLabs/Julia-1; https://supersoniclabs.ia.br/pt/julia-1/), Apache License 2.0.
+  Checkpoint SHA-256 df853bf7fe424420011f3d0c47a05d7341aa9eefa7fb9f203ea4aada4ad95b72. The request encoding, the
+  decision API and their validation messages in src/ and julia1_gguf/ follow its reference code. The model weights
+  are not part of this repository; the GGUF conversions are published at
+  https://huggingface.co/andrelucas/Julia-1-GGUF under the same license.
+* Julia-1-ONNX: the ONNX export by Supersonic Labs (https://huggingface.co/SupersonicLabs/Julia-1-ONNX), Apache
+  License 2.0. Its 100 parity cases are the requests of data/reference/parity.jsonl.
+* mmBERT-small: the multilingual ModernBERT encoder and the tokenizer Julia-1 builds on, by Johns Hopkins University
+  CLSP (https://huggingface.co/jhu-clsp/mmBERT-small; https://github.com/jhu-clsp/mmBERT; arXiv:2509.06888), MIT
+  License (THIRD_PARTY_LICENSES, entry (7)).
+* ModernBERT: the encoder architecture, by Answer.AI and LightOn (https://github.com/AnswerDotAI/ModernBERT;
+  arXiv:2412.13663). No ModernBERT code or weights are included.
+* LocalLLaMA/typed-decisions: the test set whose 2000 questions are the requests of data/reference/typed.jsonl
+  (https://huggingface.co/datasets/LocalLLaMA/typed-decisions), Apache License 2.0. data/tokenizer-corpus.jsonl
+  includes strings taken from these requests and from the Julia-1-ONNX parity cases. The reference logits in
+  data/reference/ were computed with Julia-1's reference code in PyTorch.
+
+Code compiled into the binaries
+-------------------------------
+
+* ggml / llama.cpp: tensor library, GGUF format and gguf-py by the ggml authors
+  (https://github.com/ggml-org/llama.cpp), MIT License. The build downloads release v0.5.0 and compiles its ggml
+  with the changes in patches/ggml-julia1.patch; julia1-cli and the julia1_gguf_native library link that ggml
+  statically, including llamafile's sgemm (Mozilla Foundation, MIT License) and ggml's YaRN RoPE code (Jeffrey
+  Quesnelle and Bowen Peng, MIT License).
+* nlohmann/json (https://github.com/nlohmann/json, vendored inside llama.cpp's vendor/), MIT License.
+* cpp-httplib by Yuji Hirose (https://github.com/yhirose/cpp-httplib, vendored inside llama.cpp's vendor/, compiled
+  into julia1-cli for its HTTP server), MIT License.
+
+The license texts of the third-party code compiled into julia1-cli and the julia1_gguf_native library are in
+THIRD_PARTY_LICENSES.
+
+Used for validation and benchmarks only (not distributed)
+---------------------------------------------------------
+
+* Julia-1-MLX (https://huggingface.co/zainmerchan/Julia-1-MLX) and the julia-mlx runtime
+  (https://github.com/zm2231/julia-mlx), MIT License: the MLX port used as a speed and accuracy reference.
+* llama.cpp PR #29363 (https://github.com/ggml-org/llama.cpp/pull/29363), the laya architecture: the target of the
+  laya-layout export published with the GGUF files.
+* PyTorch (https://pytorch.org/), Hugging Face transformers (https://github.com/huggingface/transformers) and
+  tokenizers (https://github.com/huggingface/tokenizers), ONNX Runtime (https://onnxruntime.ai/) and MLX
+  (https://github.com/ml-explore/mlx).

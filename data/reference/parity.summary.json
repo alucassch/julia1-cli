@@ -1,0 +1,16 @@
+{
+  "suite": "parity",
+  "count": 100,
+  "torch": "2.14.0",
+  "transformers": "5.0.0",
+  "threads": 8,
+  "encoding": {
+    "max_length": 1024,
+    "head_length": 256,
+    "strict": true
+  },
+  "elapsed_seconds": 3.867223082925193,
+  "by_type": {},
+  "total_correct": 0,
+  "max_abs_logit_error_vs_upstream_json": 0.00010287761688232422
+}
