@@ -1,23 +1,24 @@
-# Julia-1 in GGUF — specification (julia1, v1)
+# Julia-1 in GGUF — specification (v2)
 
-This document is the contract between the converter (`tools/convert_julia1_to_gguf.py`), the runtimes (C++/ggml in
-`src/`, Python/numpy in `julia1_gguf/`), the tokenizer implementations and the validation tools. Every number here was
-read from the upstream checkpoint and reference code, [SupersonicLabs/Julia-1](https://huggingface.co/SupersonicLabs/Julia-1)
+This document is the contract between the converters (llama.cpp's `convert_hf_to_gguf.py` for the published files,
+`tools/convert_julia1_to_gguf.py` for the legacy layout), the runtimes (C++/ggml in `src/`, Python/numpy in
+`julia1_gguf/`), the tokenizer implementations and the validation tools. Every number here was read from the upstream
+checkpoint and reference code, [SupersonicLabs/Julia-1](https://huggingface.co/SupersonicLabs/Julia-1)
 (weights SHA-256 `df853bf7fe424420011f3d0c47a05d7341aa9eefa7fb9f203ea4aada4ad95b72`). References to `julia/...` are to
 upstream's Python package of that name.
 
 Julia-1 is **not** a generative model. It is a *decision model*: given a `state`, a `question`, a `type` and 2–20
-`options`, it returns one logit per option. Stock llama.cpp cannot execute the decision graph (its loader rejects
-unknown tensors, and its graph has no input for the question type or the option marker positions), so the full model
-has its own architecture:
+`options`, it returns one logit per option. Two GGUF layouts hold the full model, with the same 165 tensors; the same
+weights give bit-identical logits in either:
 
-| Artifact | Architecture key | Runs in |
-| --- | --- | --- |
-| `Julia-1-<TYPE>.gguf` (full model) | `general.architecture = "julia1"` | julia1-cli (C++/ggml) and the `julia1_gguf` Python package (the same runtime, or numpy) |
-| `Julia-1-encoder-<TYPE>.gguf` (encoder only) | `general.architecture = "modern-bert"` | stock llama.cpp (`llama-embedding --pooling none`); token-level hidden states only |
+| Layout | Architecture key | Written by | Runs in |
+| --- | --- | --- | --- |
+| llama.cpp decision layout (primary: the published `Julia-1-F32.gguf`, `Julia-1-F16.gguf`) | `general.architecture = "modern-bert"` with `modern-bert.decision.*` | llama.cpp's `convert_hf_to_gguf.py` (master since [PR #29818](https://github.com/ggml-org/llama.cpp/pull/29818)) | julia1-cli (C++/ggml), the `julia1_gguf` Python package (the same runtime, or numpy), llama.cpp master (`llama-server`, `POST /v1/systemone`) |
+| `julia1` (legacy: the files of julia1-cli 0.1.0) | `general.architecture = "julia1"` | `tools/convert_julia1_to_gguf.py` | julia1-cli and `julia1_gguf` |
 
-`<TYPE>` ∈ `F32`, `F16`, `BF16`, `Q8_0`, `Q5_0`, `Q4_0`, optionally with per-tensor overrides (§2.3). K-quants are
-not used: almost every matrix has `ne[0]` = 384 or 1152, which is not a multiple of the 256-wide k-quant block.
+`<TYPE>`: F32 and F16 are published; llama.cpp's converter also writes BF16 and Q8_0, the julia1 converter BF16,
+Q8_0, Q5_0 and Q4_0, optionally with per-tensor overrides (§2.3); below F16 decisions change (§8). K-quants are not
+used: almost every matrix has `ne[0]` = 384 or 1152, which is not a multiple of the 256-wide k-quant block.
 
 ## 1. Model summary
 
@@ -37,7 +38,45 @@ Parameters exported: 144 292 870 − act_head (99 584 + 256 + 514 = 100 354) −
 
 ## 2. Full file `Julia-1-<TYPE>.gguf`
 
+Both layouts store the same tensors with the same shapes and data (§2.2). They differ in the metadata keys, the names
+of the decision-head tensors and the tokenizer block. The runtimes choose the layout from `general.architecture` and
+reject any other value.
+
 ### 2.1 Metadata
+
+**llama.cpp layout** (`convert_hf_to_gguf.py`; values of the Julia-1 files; §3 gives the checks and derived values):
+
+| Key | Type | Value |
+| --- | --- | --- |
+| `general.architecture` | str | `modern-bert` |
+| `general.name` / `general.license` | str | `Julia-1` / `apache-2.0` |
+| `general.base_model.0.repo_url` | str | `https://huggingface.co/jhu-clsp/mmBERT-small` |
+| `general.file_type` | u32 | `LlamaFileType` (ALL_F32=0, MOSTLY_F16=1, MOSTLY_Q8_0=7, MOSTLY_BF16=32) |
+| `modern-bert.block_count` | u32 | 24 (22 encoder blocks, then 2 decision blocks) |
+| `modern-bert.decision.type` | str | `laya` |
+| `modern-bert.decision.block_count` | u32 | 2 |
+| `modern-bert.decision.max_head_tokens` | u32 | 256 (llama.cpp's head budget; not read, §5 defines `head_length`) |
+| `modern-bert.feed_forward_length` | [i32] | one per block: 1152 × 22, then 1536 × 2 |
+| `modern-bert.context_length` / `.embedding_length` | u32 | 8192 / 384 |
+| `modern-bert.attention.head_count` | u32 | 6 (encoder and decision blocks; no `head_count_kv`) |
+| `modern-bert.attention.layer_norm_epsilon` (and `.layer_norm_rms_epsilon`) | f32 | 1e-5 (encoder and decision blocks) |
+| `modern-bert.attention.sliding_window` / `.sliding_window_pattern` | u32 | 128 / 3 |
+| `modern-bert.attention.causal` | bool | false |
+| `modern-bert.rope.freq_base` / `.freq_base_swa` | f32 | 160000 / 160000 (julia1-cli rejects files where they differ); no `rope.dimension_count` |
+| `modern-bert.rope.scaling.type` | str | `none` |
+| `modern-bert.vocab_size` | u32 | 256000 |
+| `modern-bert.hidden_activation` | str | `gelu` (erf; llama.cpp runs the tanh approximation) |
+| `modern-bert.classifier.pooling_type` | u32 | 1 |
+| `tokenizer.ggml.model` / `.pre` | str | `gpt2` / `mmbert` |
+| `tokenizer.ggml.tokens` / `.merges` | [str] | identical to the `julia1` layout (256000 tokens, 580604 merges) |
+| `tokenizer.ggml.token_type` | [i32] | 1 NORMAL (byte tokens included), 3 CONTROL (109 tokens), 4 USER_DEFINED (110); no `tokenizer.ggml.scores` |
+| `tokenizer.ggml.bos_token_id` / `eos_token_id` / `unknown_token_id` / `padding_token_id` / `mask_token_id` / `seperator_token_id` | u32 | 2 / 1 / 3 / 0 / 4 / 1 |
+| `tokenizer.ggml.add_bos_token` / `add_eos_token` | bool | true / true (llama.cpp's flags; ignored, the encoding adds CLS/SEP itself) |
+| `tokenizer.ggml.token_type_count` | u32 | 3 (the rows of `token_types.weight`) |
+| `tokenizer.chat_template.systemone` | str | Julia-1's prompt template (§3) |
+| `tokenizer.chat_templates` | [str] | `["systemone"]` |
+
+**julia1 layout** (legacy, `tools/convert_julia1_to_gguf.py`):
 
 | Key | Type | Value |
 | --- | --- | --- |
@@ -61,7 +100,7 @@ Parameters exported: 144 292 870 − act_head (99 584 + 256 + 514 = 100 354) −
 | `julia1.attention.sliding_window` | u32 | 128 |
 | `julia1.attention.sliding_window_pattern` | u32 | 3 (layer `il` is global iff `il % 3 == 0`) |
 | `julia1.attention.causal` | bool | false |
-| `julia1.rope.freq_base` / `.freq_base_swa` | f32 | 160000 / 160000 (runtimes reject files where they differ) |
+| `julia1.rope.freq_base` / `.freq_base_swa` | f32 | 160000 / 160000 (julia1-cli rejects files where they differ) |
 | `julia1.rope.dimension_count` | u32 | 64 |
 | `julia1.rope.scaling.type` | str | `none` |
 | `julia1.vocab_size` | u32 | 256000 |
@@ -106,7 +145,7 @@ Parameters exported: 144 292 870 − act_head (99 584 + 256 + 514 = 100 354) −
 GGUF stores a PyTorch `[out, in]` matrix with `ne = [in, out]`; `ggml_mul_mat(W, x)` then yields `out` rows. Shapes
 below are PyTorch shapes.
 
-Encoder (identical names in the encoder-only file):
+Encoder (identical names in both layouts):
 
 | GGUF name | PyTorch source | shape | dtype |
 | --- | --- | --- | --- |
@@ -120,51 +159,76 @@ Encoder (identical names in the encoder-only file):
 | `blk.{i}.ffn_down.weight` | `encoder.layers.{i}.mlp.Wo.weight` | [384, 1152] | TYPE |
 | `output_norm.weight` | `encoder.final_norm.weight` | [384] | F32 |
 
-Decision head (full file only; always F32):
+Decision head and scorer (`j` = 0, 1; the llama.cpp layout numbers the decision blocks after the 22 encoder blocks):
 
-| GGUF name | PyTorch source | shape |
-| --- | --- | --- |
-| `julia1.type_embd.weight` | `type_emb.weight` | [3, 384] |
-| `julia1.head.{j}.attn_norm.weight` / `.bias` | `head.layers.{j}.norm1.*` | [384] |
-| `julia1.head.{j}.attn_qkv.weight` / `.bias` | `head.layers.{j}.self_attn.in_proj_weight` / `in_proj_bias` (Q, K, V stacked) | [1152, 384] / [1152] |
-| `julia1.head.{j}.attn_output.weight` / `.bias` | `head.layers.{j}.self_attn.out_proj.*` | [384, 384] / [384] |
-| `julia1.head.{j}.ffn_norm.weight` / `.bias` | `head.layers.{j}.norm2.*` | [384] |
-| `julia1.head.{j}.ffn_up.weight` / `.bias` | `head.layers.{j}.linear1.*` | [1536, 384] / [1536] |
-| `julia1.head.{j}.ffn_down.weight` / `.bias` | `head.layers.{j}.linear2.*` | [384, 1536] / [384] |
-| `julia1.scorer.norm.weight` / `.bias` | `scorer.0.*` | [384] |
-| `julia1.scorer.up.weight` / `.bias` | `scorer.1.*` | [384, 384] / [384] |
-| `julia1.scorer.out.weight` / `.bias` | `scorer.3.*` | [1, 384] / [1] |
+| llama.cpp layout | julia1 layout | PyTorch source | shape |
+| --- | --- | --- | --- |
+| `token_types.weight` | `julia1.type_embd.weight` | `type_emb.weight` | [3, 384] |
+| `blk.{22+j}.attn_norm.weight` / `.bias` | `julia1.head.{j}.attn_norm.*` | `head.layers.{j}.norm1.*` | [384] |
+| `blk.{22+j}.attn_qkv.weight` / `.bias` | `julia1.head.{j}.attn_qkv.*` | `head.layers.{j}.self_attn.in_proj_weight` / `in_proj_bias` (Q, K, V stacked) | [1152, 384] / [1152] |
+| `blk.{22+j}.attn_output.weight` / `.bias` | `julia1.head.{j}.attn_output.*` | `head.layers.{j}.self_attn.out_proj.*` | [384, 384] / [384] |
+| `blk.{22+j}.ffn_norm.weight` / `.bias` | `julia1.head.{j}.ffn_norm.*` | `head.layers.{j}.norm2.*` | [384] |
+| `blk.{22+j}.ffn_up.weight` / `.bias` | `julia1.head.{j}.ffn_up.*` | `head.layers.{j}.linear1.*` | [1536, 384] / [1536] |
+| `blk.{22+j}.ffn_down.weight` / `.bias` | `julia1.head.{j}.ffn_down.*` | `head.layers.{j}.linear2.*` | [384, 1536] / [384] |
+| `cls.norm.weight` / `.bias` | `julia1.scorer.norm.*` | `scorer.0.*` | [384] |
+| `cls.weight` / `.bias` | `julia1.scorer.up.*` | `scorer.1.*` | [384, 384] / [384] |
+| `cls.output.weight` / `.bias` | `julia1.scorer.out.*` | `scorer.3.*` | [1, 384] / [1] |
 
-Dtype policy: `TYPE` applies to the five encoder matrix families only. All 1-D tensors and every `julia1.*` tensor stay
-F32 in every variant (≈15 MB). `F32` variant: everything F32. `BF16`/`F16`: encoder matrices in that type. `Q8_0`,
-`Q5_0`, `Q4_0`: quantised with `gguf.quants.quantize` (block 32; all row lengths 384/1152/2304 are multiples of 32).
-`token_embd.weight` follows TYPE like the other matrices (it holds 98.3 M of the 144 M parameters).
+Dtype policy, julia1 layout: `TYPE` applies to the five encoder matrix families only. All 1-D tensors and every
+`julia1.*` tensor stay F32 in every variant (≈15 MB), and julia1-cli requires it. `F32` variant: everything F32.
+`BF16`/`F16`: encoder matrices in that type. `Q8_0`, `Q5_0`, `Q4_0`: quantised with `gguf.quants.quantize` (block 32;
+all row lengths 384/1152/2304 are multiples of 32). `token_embd.weight` follows TYPE like the other matrices (it holds
+98.3 M of the 144 M parameters).
 
-Tensor count: full file = 1 + 1 + 21 + 22·5 + 1 = 134 encoder tensors + 1 + 2·12 + 6 = 31 head tensors = **165**.
-Encoder-only file = **134**.
+Dtype policy, llama.cpp layout: the file's type applies to every matrix, including the decision blocks' four matrices
+and `cls.weight` / `cls.output.weight` (F16 in `Julia-1-F16.gguf`); norms, biases and `token_types.weight` stay F32, and
+julia1-cli requires those to be F32. `llama-quantize` stores `cls.output.weight` 1-D ([384]); the runtimes read it as
+[1, 384].
+
+Tensor count, both layouts: 1 + 1 + 21 + 22·5 + 1 = 134 encoder tensors + 1 + 2·12 + 6 = 31 head tensors = **165**.
 
 ### 2.3 Per-tensor overrides
 
-`--override 'pattern=TYPE[,pattern=TYPE...]'` (repeatable) sets per-tensor types after the base TYPE: `fnmatch` on the
-GGUF tensor names, 2-D tensors only, last matching rule wins. 1-D tensors always stay F32; `julia1.*` 2-D tensors change
-only when a pattern matches them explicitly, and julia1-cli requires every `julia1.*` and 1-D tensor to be F32. A file
-written with overrides carries `julia1.quantization.recipe`; `general.file_type` keeps the base TYPE's value. The
-published recipe is `Julia-1-F16-embdQ8_0.gguf`: `token_embd.weight` in Q8_0, everything else as in F16.
+`tools/convert_julia1_to_gguf.py --override 'pattern=TYPE[,pattern=TYPE...]'` (repeatable) sets per-tensor types
+after the base TYPE: `fnmatch` on the GGUF tensor names, 2-D tensors only, last matching rule wins. 1-D tensors always
+stay F32; `julia1.*` 2-D tensors change only when a pattern matches them explicitly, and julia1-cli requires every
+`julia1.*` and 1-D tensor to be F32. A file written with overrides carries `julia1.quantization.recipe`;
+`general.file_type` keeps the base TYPE's value. julia1-cli 0.1.0 published the recipe `Julia-1-F16-embdQ8_0.gguf`
+(`token_embd.weight` in Q8_0, everything else as in F16); it is no longer published.
 
-## 3. Encoder-only file `Julia-1-encoder-<TYPE>.gguf`
+## 3. llama.cpp layout: checks and derived values
 
-Same encoder tensors, `general.architecture = "modern-bert"`, and the hparams stock llama.cpp's `ModernBertModel`
-converter would write, under the `modern-bert.` prefix: `context_length 8192`, `embedding_length 384`, `block_count 22`,
-`feed_forward_length 1152`, `attention.head_count 6`, `attention.head_count_kv 6`, `attention.layer_norm_epsilon 1e-5`,
-`rope.freq_base 160000`, `rope.freq_base_swa 160000`, `rope.dimension_count 64`, `attention.sliding_window 128`,
-`attention.sliding_window_pattern 3`, `rope.scaling.type none`, `vocab_size 256000`, `hidden_activation gelu`,
-`attention.causal false`, `pooling_type 0` (none). Same tokenizer block as §2.1 (`add_bos_token=false`,
-`add_eos_token=false`, `add_space_prefix=true`, `julia1.tokenizer.added_tokens` / `added_token_ids`).
+The runtimes load a `modern-bert` file only when (in this order) the `modern-bert.decision.*` keys exist (a file
+without them is encoder-only), `modern-bert.decision.type` is `laya`, and `tokenizer.chat_template.systemone` equals
+Julia-1's template byte for byte (331 ASCII characters, one line):
 
-Known deviations of stock llama.cpp on this file: (a) its SPM tokenizer merges over the whole string and prefixes
-exactly one space, while HF splits at every `▁` (runs of spaces, tabs, newlines and added tokens differ); (b) its GeGLU
-uses the tanh GELU approximation. Users who need exact parity feed token ids and compare hidden states; the
-encoder-only file is an embeddings and validation vehicle, not the decision model.
+```
+<bos>{{ type }} question: {{ instructions if instructions is string else instructions | tojson }}<eos>{% for o in options %}<mask> {% if o.description %}{{ o.description if o.description is string else o.description | tojson }}{% else %}{{ o.key }}{% endif %}{% endfor %}<eos>{{ state if state is string else state | tojson }}<eos>
+```
+
+Laya, another model of the same family in the same layout, has another template and is rejected. The template renders
+the sequence of §5: `<bos>` head `<eos>`, then `<mask>`, a space and the description (or the key) for each option,
+`<eos>`, state, `<eos>`. Values the julia1 layout stores as keys are derived or fixed:
+
+| Value | llama.cpp layout | julia1 layout |
+| --- | --- | --- |
+| encoder layers (22) | `block_count` − `decision.block_count` | `julia1.block_count` |
+| encoder / head FFN (1152 / 1536) | `feed_forward_length[0]` / `[22]` (equal within each part) | `julia1.feed_forward_length` / `julia1.head.feed_forward_length` |
+| RoPE dimensions (64) | `embedding_length` / `attention.head_count` | `julia1.rope.dimension_count` |
+| head attention heads, head norm eps (6, 1e-5) | `attention.head_count`, `attention.layer_norm_epsilon` | `julia1.head.attention.head_count`, `julia1.head.layer_norm_epsilon` |
+| CLS / SEP / marker ids (2 / 1 / 4) | `tokenizer.ggml.bos_token_id` / `eos_token_id` / `mask_token_id` | `julia1.encoding.*_token_id` |
+| marker text (`<mask>`) | `tokenizer.ggml.tokens[mask_token_id]` | `julia1.encoding.marker_token_text` |
+| head template, option prefix, option token limit, min / max options, default max / head length, question types | fixed Julia-1 values: `{type} question: {question}`, ` `, 48, 2 / 20, 8192 / 512, `choice`, `score`, `noul` | `julia1.encoding.*`, `julia1.qtype_names` (the same values) |
+| added tokens (249) | every CONTROL (109) and USER_DEFINED (110) token, plus every token made only of `▁` with length ≥ 2 (ids 139–168) | `julia1.tokenizer.added_tokens` / `added_token_ids` |
+
+llama.cpp's converter marks the 30 runs of `▁` NORMAL, but upstream's tokenizer still matches them as added tokens on
+the raw text (`"▁▁"` → `[139]`, `"a▁▁b"` → `[476, 139, 518]`); the single `▁` (235248) is not an added token. The
+rule reproduces the julia1 file's 249 added tokens exactly. Byte tokens `<0xNN>` are NORMAL in this layout (BYTE in the
+julia1 layout).
+
+Retired files: julia1-cli 0.1.0 also published `Julia-1-encoder-<TYPE>.gguf` (`modern-bert` without the decision keys,
+134 encoder tensors, for `llama-embedding`) and `Julia-1-laya-F32.gguf` (architecture `laya` of llama.cpp PR #29363,
+superseded by PR #29818). Neither is published any more, and the runtimes reject both.
 
 ## 4. Tokenizer (must equal HF `tokenizers` on `tokenizer.json`)
 
@@ -172,7 +236,8 @@ Configuration: normalizer `Replace(" " → "▁")`; pre-tokenizer `Metaspace(rep
 split=true)`; model BPE (`byte_fallback=true`, `fuse_unk=true`, `ignore_merges=false`, no dropout, no prefix/suffix);
 249 added tokens, all `normalized=false, single_word=false, rstrip=false`, `lstrip=false` except `<mask>`
 (`lstrip=true`, irrelevant because the encoding strips `<mask>` from every input). The encoding always calls
-`add_special_tokens=False`, so the post-processor never runs.
+`add_special_tokens=False`, so the post-processor never runs. In GGUF the added tokens are
+`julia1.tokenizer.added_tokens` (julia1 layout) or follow the rule of §3 (llama.cpp layout).
 
 Algorithm `encode(text) -> ids`:
 
@@ -194,7 +259,7 @@ Reference outcomes: `"hello"` and `" hello"` → `[25612]`; `"  hello"` → `[23
 
 Acceptance: 0 mismatching sequences against HF `tokenizers` on `data/tokenizer-corpus.jsonl` (4595 strings: every
 state, question, option and head string of both reference sets, `" "` + option, plus fuzz strings with whitespace runs,
-tabs, newlines, tags, digits, emoji, CJK, Arabic, Devanagari and out-of-vocabulary code points).
+tabs, newlines, tags, digits, emoji, CJK, Arabic, Devanagari and out-of-vocabulary code points), in both layouts.
 
 ## 5. Request encoding (`julia/data.py::sequence`)
 
@@ -236,15 +301,19 @@ Validation and serialisation rules (upstream `validate_row` and `FastEngine`):
   `", "` and `": "`. Integers of any size are written verbatim (`123456789012345678901234567890`); floats follow Python
   `repr` (exponent form iff decpt ≤ −4 or > 16), `-0.0` stays `-0.0`, `-0` becomes `0`, `1E2` becomes `100.0`; a
   duplicate key keeps the last value at the first key's position. NaN and infinite floats are rejected
-  (`Out of range float values are not JSON compliant`).
+  (`Out of range float values are not JSON compliant`). llama.cpp's `tojson` (in the template of §3) writes floats
+  with 6 significant digits and drops `.0` (`532.0` → `532`, `1234567.5` → `1.23457e+06`), so `llama-server` encodes a
+  JSON state sent as an object differently; a state sent as a string pre-serialised with `json.dumps` is encoded as
+  here.
 * `target`, if present, must be an int (not a bool) with `0 <= target < len(options)`
   (`target must index the supplied option list`); `teacher_logits`, if not null, must be a list of exactly
   `len(options)` finite numbers (`teacher logits must be finite and match option count/order`).
-* `max_length` is validated when the engine is created: `1 ≤ max_length ≤ julia1.context_length`, else
+* `max_length` is validated when the engine is created: `1 ≤ max_length ≤ context_length` (8192, §2.1), else
   `max_length must be an integer between 1 and 8192`.
-* Defaults are those of upstream `julia.load_model`: `max_length=None` (→ `julia1.context_length` = 8192),
+* Defaults are those of upstream `julia.load_model`: `max_length=None` (→ `context_length` = 8192),
   `head_length=256`, strict off. Upstream's recommended policy (`inference-policy.json`, recorded in
-  `julia1.encoding.default_*`) is 8192 / 512 / strict, which `julia1-cli serve` uses by default. The evaluation
+  `julia1.encoding.default_*` of the julia1 layout, fixed for the llama.cpp layout) is 8192 / 512 / strict, which
+  `julia1-cli serve` uses by default. The evaluation
   protocol (§8) is 1024 / 512 (typed) or 256 (parity) / strict.
 
 ## 6. Forward pass (single unpadded sequence of n tokens, positions 0..n−1)
@@ -316,15 +385,19 @@ thresholds:
 | F32, exact (Metal `--precise`, numpy) | ≤ 1e-3 | 2000/2000 | 1451 | 100/100, ≤ 1e-3 |
 | F32, CPU | ≤ 2e-3 | 2000/2000 | 1451 | 100/100, ≤ 2e-3 |
 | F16 (exact or `--fast`) | reported | 2000/2000 | 1451 ± 3 | 100/100 |
-| F16-embdQ8_0 (mixed recipe) | reported | ≥ 1990/2000 | 1451 ± 5 | reported |
+| F16-embdQ8_0 (mixed recipe, julia1 layout; not published) | reported | ≥ 1990/2000 | 1451 ± 5 | reported |
 | BF16, Q8_0, Q5_0, Q4_0 | reported | reported | reported | reported |
 
 Max abs is an acceptance criterion for F32 only: rounding the weights to F16, BF16 or Q8_0 moves the logits by 0.04 to
 2 even in an exact runtime (upstream PyTorch with identically rounded weights shows the same deviation), so the other
-files are accepted on decisions. BF16 (1994/2000) and plain Q8_0 (about 1940/2000) do not meet the F16 and mixed-recipe
-bars, and Q5_0/Q4_0 lose accuracy; they are not published.
+files are accepted on decisions. BF16 encoder matrices (1994/2000 in the julia1 layout; 1986/2000 with every matrix in
+BF16, ggml-org's file) and plain Q8_0 (about 1940/2000) do not meet the F16 and mixed-recipe bars, and Q5_0/Q4_0 lose
+accuracy; they are not published.
 
-The encoder-only file in stock llama.cpp is compared on hidden states for identical token ids (looser: tanh GELU).
+The two layouts of the same weights must give byte-identical output. llama.cpp's `llama-server` (`/v1/systemone`) is
+compared end to end, on decisions and on logits recovered from its probabilities
+([docs/BENCHMARKS.md](docs/BENCHMARKS.md) §F); it is not held to these thresholds (tanh GeGLU, `tojson` floats, §3 and
+§5).
 
 ## 9. Non-goals
 

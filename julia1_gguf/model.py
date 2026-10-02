@@ -90,6 +90,8 @@ class JuliaModel:
                 'ffn_up.weight', 'ffn_up.bias', 'ffn_down.weight', 'ffn_down.bias')})
         self.scorer = {k: t('julia1.scorer.' + k) for k in (
             'norm.weight', 'norm.bias', 'up.weight', 'up.bias', 'out.weight', 'out.bias')}
+        # [1, E]: llama-quantize writes this tensor with n_dims 1, which gguf-py reads as [E]
+        self.scorer['out.weight'] = self.scorer['out.weight'].reshape(1, -1)
         # inv_freq exactly as HF computes it (float32 pow, float32 reciprocal)
         exponent = np.arange(0, self.rope_dims, 2, dtype=np.int64).astype(F32) / F32(self.rope_dims)
         self.inv_freq = F32(1.0) / (F32(self.rope_theta) ** exponent)

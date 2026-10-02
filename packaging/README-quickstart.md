@@ -1,4 +1,4 @@
-# julia1-cli 0.1.0 — quickstart
+# julia1-cli 0.2.0 — quickstart
 
 Native runtime for the [Julia-1](https://huggingface.co/SupersonicLabs/Julia-1) decision model by Supersonic Labs, in
 GGUF: a state, a question, a type (`choice`, `score` or `noul`) and 2–20 options in, one logit per option out. It is
@@ -17,7 +17,7 @@ This archive (macOS, Apple silicon) contains:
 ggml (with the repository's exact Metal kernels) and its Metal shader library are compiled in; the binaries depend
 only on macOS system libraries and frameworks. They are built for macOS 14 or later and were tested on macOS 27
 (M1 Pro). They are not signed by a developer ID: if macOS refuses to open a file downloaded with a browser, run
-`xattr -dr com.apple.quarantine julia1-cli-0.1.0-macos-arm64` once. The Python package (`julia1-gguf`) is not in this
+`xattr -dr com.apple.quarantine julia1-cli-0.2.0-macos-arm64` once. The Python package (`julia1-gguf`) is not in this
 archive: install its wheel from the release page, or build it from the source repository (`pip install .`).
 
 The first Metal run on a machine compiles the embedded shader source and takes about 20 s; macOS caches the result,
@@ -25,9 +25,10 @@ and later starts take 0.1–0.3 s. `--device cpu` does not need the shaders.
 
 ## Model
 
-Download a model file from https://huggingface.co/andrelucas/Julia-1-GGUF: `Julia-1-F32.gguf` (593 MB, exact
-reference: 2000/2000 decisions of upstream PyTorch on the typed test set) or `Julia-1-F16.gguf` (312 MB, 2000/2000
-with `--fast`).
+Download a model file from https://huggingface.co/andrelucas/Julia-1-GGUF: `Julia-1-F32.gguf` (592 MB, exact
+reference: 2000/2000 decisions of upstream PyTorch on the typed test set) or `Julia-1-F16.gguf` (303 MB, 2000/2000
+with `--fast`). They are in llama.cpp's layout and also run in llama.cpp master (`llama-server`, `POST /v1/systemone`);
+julia1-cli still loads the `julia1`-layout files of version 0.1.0.
 
 ## CLI
 

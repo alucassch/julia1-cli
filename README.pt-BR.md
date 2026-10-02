@@ -19,18 +19,11 @@ opção, e quem chama aplica softmax e argmax. É um encoder mmBERT-small (Moder
 vocabulário de 256 000, contexto de 8192) seguido de um módulo de decisão tipado (um embedding do tipo de pergunta,
 duas camadas transformer e um scorer lido no marcador `<mask>` antes de cada opção); 144,19 M de parâmetros.
 
-O llama.cpp de fábrica não executa o módulo de decisão: o carregador rejeita os tensores desse módulo e o grafo não tem
-entrada para o tipo de pergunta nem para as posições dos marcadores. Por isso o modelo completo usa uma arquitetura
-GGUF própria, `julia1`, que este runtime carrega. O [SPEC.md](SPEC.md) define o formato do arquivo, o tokenizador, a
-codificação das requisições, o forward e o protocolo de validação.
-
-**Suporte no llama.cpp.** O [PR #29363 do llama.cpp](https://github.com/ggml-org/llama.cpp/pull/29363) adiciona
-suporte a essa família de modelos de decisão (a arquitetura `laya`). O `Julia-1-laya-F32.gguf` é exportado nesse
-formato e já reproduz o modelo original em PyTorch no runtime do PR (2000/2000 decisões no conjunto de teste
-typed-decisions, commit `ffc55c93bc`, CPU); esse commit corrige os problemas encontrados ao validar o Julia-1 no PR
-([relato](https://github.com/ggml-org/llama.cpp/pull/29363#issuecomment-5861969778)). Se o PR for integrado, esse arquivo deve rodar no llama.cpp oficial
-sem o julia1-cli. A CLI do PR (`llama-laya-cli`) ainda não codifica como o Julia-1 as perguntas `noul` que têm
-descrições. Até lá, use o julia1-cli ou o pacote Python `julia1-gguf`.
+Os arquivos GGUF estão no layout do llama.cpp para este modelo (arquitetura `modern-bert` com dois blocos de decisão,
+gravados pelo `convert_hf_to_gguf.py` do llama.cpp), então os mesmos arquivos rodam no julia1-cli e no llama.cpp
+oficial, no master ([abaixo](#julia-1-no-llamacpp)). O julia1-cli também carrega o layout `julia1` dos arquivos da
+versão 0.1.0. O [SPEC.md](SPEC.md) define os dois layouts, o tokenizador, a codificação das requisições, o forward e o
+protocolo de validação.
 
 ## Conteúdo
 
@@ -39,8 +32,9 @@ descrições. Até lá, use o julia1-cli ou o pacote Python `julia1-gguf`.
 | `src/` | o runtime: carregador GGUF, tokenizador, codificação, grafo ggml, CLI, servidor HTTP, API C |
 | `patches/ggml-julia1.patch` | mudanças no ggml (MIT): kernels Metal F32 exatos, epílogos fundidos nas GEMMs do Metal, ganhos na CPU; aplicado na compilação |
 | `julia1_gguf/` | o pacote Python `julia1-gguf`: o mesmo runtime pela API C, ou um runtime em numpy puro |
-| `tools/convert_julia1_to_gguf.py` | conversor do checkpoint safetensors do upstream para GGUF |
+| `tools/convert_julia1_to_gguf.py` | conversor do checkpoint safetensors do upstream para o layout legado `julia1` |
 | `tools/eval_gguf.py`, `tools/compare_replay.py`, `tools/tokenizer_parity*.py` | validação contra os dados de referência |
+| `tools/systemone_parity.py` | as mesmas 2000 perguntas tipadas por um servidor HTTP (`/v1/systemone` do llama-server ou `julia1-cli serve`) |
 | `data/reference/` | logits de referência do PyTorch original: 2000 perguntas do typed-decisions e 100 casos de paridade |
 | `data/tokenizer-corpus.jsonl` | 4595 strings para a verificação de paridade do tokenizador |
 | `docs/server.md`, `docs/BENCHMARKS.md` | a API HTTP; configuração e tabelas completas dos benchmarks |
@@ -175,24 +169,28 @@ no [guia rápido](packaging/README-quickstart.md) (em inglês).
 
 ## Arquivos do modelo
 
-Em [andrelucas/Julia-1-GGUF](https://huggingface.co/andrelucas/Julia-1-GGUF):
+Em [andrelucas/Julia-1-GGUF](https://huggingface.co/andrelucas/Julia-1-GGUF), convertidos com o
+`convert_hf_to_gguf.py` do llama.cpp ([PR #29818](https://github.com/ggml-org/llama.cpp/pull/29818)); os mesmos
+arquivos rodam no llama.cpp:
 
 | arquivo | tamanho | uso |
 | --- | --- | --- |
-| `Julia-1-F32.gguf` | 593 MB | referência exata |
-| `Julia-1-F16.gguf` | 312 MB | metade do tamanho; kernels exatos ou `--fast` |
-| `Julia-1-F16-embdQ8_0.gguf` | 220 MB | o menor arquivo (tabela de embeddings em Q8_0); 1990–1992 de 2000 decisões |
-| `Julia-1-encoder-{F32,F16}.gguf` | 578 / 297 MB | só o encoder (`modern-bert`), para o llama.cpp de fábrica: estados ocultos por token, sem decisões |
-| `Julia-1-laya-F32.gguf` | 592 MB | o mesmo modelo no layout `laya` do [PR #29363 do llama.cpp](https://github.com/ggml-org/llama.cpp/pull/29363) |
+| `Julia-1-F32.gguf` | 592 MB | referência exata |
+| `Julia-1-F16.gguf` | 303 MB | metade do tamanho; kernels exatos ou `--fast` |
 
-Matrizes do encoder em BF16 e Q8_0/Q5_0/Q4_0 mudam decisões e não são publicadas. Para converter o checkpoint do
-upstream você mesmo (Python com `numpy`, `safetensors` e `gguf`):
+Os arquivos no layout `julia1` do julia1-cli 0.1.0 (a revisão anterior do repositório) continuam carregando; os
+arquivos só do encoder, `laya` e `F16-embdQ8_0` daquela versão não são mais publicados. O julia1-cli para com um erro
+em arquivos só do encoder e em modelos da mesma família com outro template de prompt (Laya). Matrizes em BF16 e Q8_0
+mudam decisões (as conversões da ggml-org, [ggml-org/Julia-1-GGUF](https://huggingface.co/ggml-org/Julia-1-GGUF):
+1986 e 1946 de 2000 no julia1-cli) e não são publicadas. Para converter o checkpoint do upstream você mesmo, com o
+llama.cpp master:
 
 ```sh
-python tools/convert_julia1_to_gguf.py --upstream <SupersonicLabs/Julia-1 download> --outdir models --types F32,F16 --encoder-types F32,F16
-python tools/convert_julia1_to_gguf.py --upstream <SupersonicLabs/Julia-1 download> --outdir models --types F16 \
-    --override token_embd.weight=Q8_0 --name-suffix=-embdQ8_0
+python convert_hf_to_gguf.py <SupersonicLabs/Julia-1 download> --outtype f32 --outfile Julia-1-F32.gguf   # or f16
 ```
+
+O `tools/convert_julia1_to_gguf.py` (Python com `numpy`, `safetensors` e `gguf`) continua gravando o layout legado
+`julia1`, com tipos por tensor ([SPEC.md](SPEC.md) §2.3).
 
 ## Resultados
 
@@ -213,12 +211,13 @@ pelo batching próprio de cada runtime.
 | **PyTorch CPU, 4 threads (upstream)** | 60,1 | 1,00× | 26 | 2000/2000 | 1451 | 2,3e-4 |
 | ONNX Runtime CPU, 8 threads (Julia-1-ONNX) | 85,3 | 0,70× | 11 | 2000/2000 | 1451 | 7,6e-4 |
 
+* Medido com o julia1-cli 0.1.0 nos arquivos dele, no layout `julia1`; com os mesmos pesos F32, a versão 0.2.0 dá
+  saída idêntica byte a byte a partir do `Julia-1-F32.gguf` no layout do llama.cpp.
 * Os 100 casos de paridade dão 100/100 decisões em todas as configurações do julia1-cli acima; o backend nativo do
   pacote Python dá os mesmos logits do julia1-cli e soma 0,0–0,3 ms por chamada.
 * De ponta a ponta, o tokenizador e a codificação do julia1-cli produzem exatamente os ids de referência (0
   divergências nas 2000 requisições typed e nas 100 de paridade); o tokenizador coincide com o `tokenizers` da HF nas
-  4595 strings de `data/tokenizer-corpus.jsonl`.
-* O `Julia-1-F16-embdQ8_0.gguf` mantém 1990–1992/2000 decisões (acurácia 1452) e 99–100/100 casos de paridade.
+  4595 strings de `data/tokenizer-corpus.jsonl`, nos dois layouts.
 * O `julia1-cli serve` responde 103 requisições/s (exato) e 112 (fast) com 32 clientes simultâneos, 128 e 136 com
   `--devices metal,cpu`. Do início do processo à primeira resposta são cerca de 0,2 s.
 
@@ -232,6 +231,45 @@ python tools/eval_gguf.py --runtime cli --cli build/julia1-cli --model Julia-1-F
     --device cpu --min-argmax 100 --max-abs 2e-3
 ```
 
+## Julia-1 no llama.cpp
+
+O llama.cpp master roda o Julia-1 a partir dos mesmos arquivos desde 2026-10-02
+([PR #29818](https://github.com/ggml-org/llama.cpp/pull/29818); nenhum release com tag o inclui ainda). O
+`llama-server` recebe em `POST /v1/systemone` o mesmo corpo `{"state", "questions"}` do `/v1/predict` do
+`julia1-cli serve`:
+
+```sh
+llama-server -m Julia-1-F16.gguf -b 2048 -ub 2048      # -ub >= the longest prompt in tokens (up to 8192)
+curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -d @questions.jsonl
+```
+
+* O `-ub` (padrão 512) precisa comportar o prompt inteiro: com os padrões, 35 das 2000 perguntas typed falham com HTTP
+  500 (`input (N tokens) is too large to process`).
+* Envie um state JSON como string serializada por você (`json.dumps` do Python). O `tojson` do llama.cpp escreve
+  floats com 6 dígitos significativos e descarta o `.0` (`532.0` → `532`, `1234567.5` → `1.23457e+06`): com o state
+  enviado como objeto, 480 dos 2000 prompts typed são tokenizados de forma diferente da do upstream, e 51 das 52
+  decisões alteradas vêm deles.
+* O llama.cpp roda o `gelu` do ModernBERT como a GeGLU do ggml com a aproximação por tanh, enquanto o upstream usa a
+  erf exata; com o state enviado como string, essa é a principal fonte de erro que resta. Na CPU, acrescente `-fa off`
+  (o flash attention soma um pouco de erro ali).
+
+As 2000 perguntas typed, uma pergunta por requisição, HTTP sequencial a partir do mesmo cliente para os dois
+servidores (Apple M1 Pro, llama.cpp master `1fb7ef3e`). As diferenças de logit são recuperadas das probabilidades
+devolvidas; os ms incluem a ida e volta HTTP, então não são comparáveis com a tabela acima:
+
+| servidor, arquivo, dispositivo | decisões iguais à referência | mediana / máx. abs. da diferença de logit | ms por requisição |
+| --- | --- | --- | --- |
+| llama-server, F32, Metal | 1999/2000 | 0,037 / 0,40 | 22,8 |
+| llama-server, F32, CPU, 6 threads | 1999/2000 | 0,030 / 0,29 | 62,2 |
+| llama-server, F16, Metal | 2000/2000 | 0,039 / 0,58 | 21,8 |
+| julia1-cli serve, F32, Metal exato | 2000/2000 | 5,0e-5 / 8,5e-4 | 13,4 |
+| julia1-cli serve, F16, Metal `--fast` | 2000/2000 | 0,023 / 0,41 | 12,5 |
+
+O llama-server rodou com `-b 1024 -ub 1024` e o state enviado como string; o julia1-cli, com os arquivos da versão
+0.1.0, no layout `julia1`. O julia1-cli é cerca de 1,7× mais rápido aqui e exato no Metal. Os arquivos BF16 e Q8_0 da
+ggml-org dão 1987 e 1947 de 2000 no llama-server. Detalhes e as outras configurações:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) §F (em inglês).
+
 ## Limitações
 
 * O Julia-1 compara as opções que recebe; não é um modelo de conhecimento nem de raciocínio. Avalie-o nas suas
@@ -240,9 +278,6 @@ python tools/eval_gguf.py --runtime cli --cli build/julia1-cli --model Julia-1-F
 * O ggml compila os shaders Metal quando um processo inicia; quando o cache de shaders do macOS falha (na primeira
   execução numa máquina, ou depois que outro build do ggml rodou), a partida leva cerca de 20 s em vez de 0,1–0,3 s.
   `--device cpu` também é afetado, porque todos os backends são registrados na partida.
-* O `Julia-1-F16-embdQ8_0.gguf` está no piso de aceitação do [SPEC.md](SPEC.md) §8 (pelo menos 1990/2000): a tabela
-  de embeddings em Q8_0 inverte algumas decisões limítrofes. Use F32 ou F16 quando toda decisão precisar coincidir
-  com a referência.
 * Um build contra o ggml sem modificações (`-DJULIA1_GGML_PATCH=OFF`) é exato, mas cerca de 4x mais lento no modo
   `--precise` no Metal.
 * O batching aplica padding às requisições agrupadas: os logits ficam dentro dos limites, mas as probabilidades podem
@@ -263,7 +298,10 @@ python tools/eval_gguf.py --runtime cli --cli build/julia1-cli --model Julia-1-F
 * [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp) v0.5.0 (MIT): a biblioteca de tensores, o formato GGUF e
   o gguf-py; o sgemm do llamafile (MIT), o [cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT) e o
   [nlohmann/json](https://github.com/nlohmann/json) (MIT) vêm com ele.
-* [PR #29363 do llama.cpp](https://github.com/ggml-org/llama.cpp/pull/29363): a arquitetura `laya` da exportação laya.
+* [PR #29818 do llama.cpp](https://github.com/ggml-org/llama.cpp/pull/29818) (MIT): o Julia-1 no llama.cpp
+  (`/v1/systemone` do `llama-server`) e o `convert_hf_to_gguf.py` que gravou os arquivos publicados;
+  [ggml-org/Julia-1-GGUF](https://huggingface.co/ggml-org/Julia-1-GGUF): as conversões BF16 e Q8_0 da ggml-org, usadas
+  para comparação.
 * [LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) (Apache-2.0): o conjunto de
   teste dos dados de referência.
 * [PyTorch](https://pytorch.org/), [transformers](https://github.com/huggingface/transformers) e

@@ -20,7 +20,10 @@ Model and data
   Checkpoint SHA-256 df853bf7fe424420011f3d0c47a05d7341aa9eefa7fb9f203ea4aada4ad95b72. The request encoding, the
   decision API and their validation messages in src/ and julia1_gguf/ follow its reference code. The model weights
   are not part of this repository; the GGUF conversions are published at
-  https://huggingface.co/andrelucas/Julia-1-GGUF under the same license.
+  https://huggingface.co/andrelucas/Julia-1-GGUF under the same license. They were converted with llama.cpp's
+  convert_hf_to_gguf.py (https://github.com/ggml-org/llama.cpp, MIT License; Julia-1 support from pull request #29818,
+  https://github.com/ggml-org/llama.cpp/pull/29818); the files of julia1-cli 0.1.0 were converted with
+  tools/convert_julia1_to_gguf.py.
 * Julia-1-ONNX: the ONNX export by Supersonic Labs (https://huggingface.co/SupersonicLabs/Julia-1-ONNX), Apache
   License 2.0. Its 100 parity cases are the requests of data/reference/parity.jsonl.
 * mmBERT-small: the multilingual ModernBERT encoder and the tokenizer Julia-1 builds on, by Johns Hopkins University
@@ -53,8 +56,9 @@ Used for validation and benchmarks only (not distributed)
 
 * Julia-1-MLX (https://huggingface.co/zainmerchan/Julia-1-MLX) and the julia-mlx runtime
   (https://github.com/zm2231/julia-mlx), MIT License: the MLX port used as a speed and accuracy reference.
-* llama.cpp PR #29363 (https://github.com/ggml-org/llama.cpp/pull/29363), the laya architecture: the target of the
-  laya-layout export published with the GGUF files.
+* llama.cpp master with pull request #29818 (https://github.com/ggml-org/llama.cpp/pull/29818), MIT License: its
+  llama-server (/v1/systemone) was compared with julia1-cli. ggml-org/Julia-1-GGUF
+  (https://huggingface.co/ggml-org/Julia-1-GGUF), ggml-org's conversions of Julia-1, was used for comparison.
 * PyTorch (https://pytorch.org/), Hugging Face transformers (https://github.com/huggingface/transformers) and
   tokenizers (https://github.com/huggingface/tokenizers), ONNX Runtime (https://onnxruntime.ai/) and MLX
   (https://github.com/ml-explore/mlx).

@@ -62,12 +62,8 @@ class Engine:
     backend = 'numpy'
 
     def __init__(self, path, max_length=None, head_length=256, strict_encoding=False, *, tokenizer='auto'):
-        self.gguf = GGUFModel(path)
+        self.gguf = GGUFModel(path)  # rejects any GGUF but a full Julia-1 one (julia1 or llama.cpp layout)
         self.metadata = self.gguf.metadata
-        arch = self.metadata.get('general.architecture')
-        if arch != 'julia1':
-            raise ValueError(f"general.architecture is '{arch}', expected 'julia1' (a full Julia-1 GGUF written by "
-                             'tools/convert_julia1_to_gguf.py)')
         limit = self.metadata['julia1.context_length']
         if max_length is None:  # upstream julia/inference.py::context_length: None -> checkpoint limit
             max_length = limit

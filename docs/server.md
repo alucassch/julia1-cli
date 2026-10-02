@@ -69,6 +69,9 @@ All bodies are JSON. An error is `{"error": message}`, with an `"index"` field f
 | `POST /v1/tokenize` | `{"texts": [string]}` | `{"ids": [[...]]}` (SPEC §4, no CLS/SEP) |
 | `GET /` | - | the playground (no key needed) |
 
+llama.cpp's `llama-server` takes the same named-question body at `POST /v1/systemone`
+([README](../README.md#julia-1-in-llamacpp)).
+
 | status | when |
 |---|---|
 | 400 | invalid JSON, wrong body shape, validation or encoding (strict) error |

@@ -9,7 +9,7 @@ import json
 import re
 
 META = '▁'
-CONTROL_TYPE = 3  # gguf.TokenType.CONTROL: the 7 special added tokens
+CONTROL_TYPE = 3  # gguf.TokenType.CONTROL: the 7 special added tokens (109 in the llama.cpp layout; encoding is the same)
 # Rust `char::is_whitespace` (Unicode White_Space), used by the `lstrip` flag of <mask>.
 WHITESPACE = frozenset('\t\n\x0b\x0c\r \x85\xa0     　'
                        + ''.join(chr(c) for c in range(0x2000, 0x200b)))

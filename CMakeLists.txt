@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18) # FetchContent_MakeAvailable with SOURCE_SUBDIR, find_program REQUIRED
-project(julia1-gguf VERSION 0.1.0 LANGUAGES C CXX) # the release version: julia1-cli --version, julia1_version(), info()
+project(julia1-gguf VERSION 0.2.0 LANGUAGES C CXX) # the release version: julia1-cli --version, julia1_version(), info()
 set(JULIA1_VERSION ${PROJECT_VERSION})              # (pyproject.toml repeats it; tools/package_release.sh checks both)
 
 set(CMAKE_CXX_STANDARD 17)

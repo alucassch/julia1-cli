@@ -1,4 +1,5 @@
-// Loads Julia-1-<TYPE>.gguf (SPEC §2): metadata, tokenizer and the 165 tensors into a backend buffer.
+// Loads Julia-1-<TYPE>.gguf (SPEC §2), in the julia1 or in llama.cpp's modern-bert decision layout: metadata, tokenizer
+// and the 165 tensors into a backend buffer.
 #pragma once
 
 #include "tokenizer.h"
@@ -29,13 +30,13 @@ struct HeadLayer {
 };
 
 struct JuliaModel {
-    // hparams (julia1.*)
+    // hparams (julia1.* / modern-bert.*)
     int32_t n_ctx = 0, n_embd = 0, n_layer = 0, n_ff = 0, n_head = 0, n_rot = 0, n_vocab = 0;
     int32_t swa = 0, swa_pattern = 0;
     float eps = 1e-5f, rope_base = 0.f;
     int32_t head_layers = 0, head_n_head = 0, head_ff = 0;
     float head_eps = 1e-5f;
-    // encoding (julia1.encoding.*)
+    // encoding (julia1.encoding.*; llama.cpp's layout: the tokenizer's ids, and these defaults, Julia-1's values)
     int32_t cls_id = 2, sep_id = 1, marker_id = 4;
     std::string marker_text, head_template, option_prefix;
     int32_t option_token_limit = 48, min_options = 2, max_options = 20;

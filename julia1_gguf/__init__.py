@@ -5,7 +5,7 @@ Imports are lazy so `python -m julia1_gguf --threads N` can set BLAS thread
 environment variables before numpy loads.
 """
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 _warned = False
 

@@ -5,6 +5,39 @@ the C API's `julia1_version()` and `info()["version"]`, and is repeated in `pypr
 `julia1_gguf/__init__.py`; `tools/package_release.sh` stops if they disagree. It is the version of the runtime and
 tools; the GGUF files carry their own provenance (`manifest.json` of the model repository).
 
+## [0.2.0] — 2026-10-02
+
+julia1-cli loads the GGUF layout of llama.cpp ([PR #29818](https://github.com/ggml-org/llama.cpp/pull/29818), merged
+2026-10-02), and the model files are now in that layout: the same files run in julia1-cli and in llama.cpp master.
+
+### Changed
+
+- **Model files**: [andrelucas/Julia-1-GGUF](https://huggingface.co/andrelucas/Julia-1-GGUF) holds `Julia-1-F32.gguf`
+  and `Julia-1-F16.gguf` (same names) in llama.cpp's layout: architecture `modern-bert` with `modern-bert.decision.*`
+  keys and Julia-1's `tokenizer.chat_template.systemone`, written by llama.cpp's `convert_hf_to_gguf.py`. They also run
+  in `llama-server` (`POST /v1/systemone`). The encoder-only, `laya` (llama.cpp PR #29363) and `F16-embdQ8_0` files of
+  0.1.0 are no longer published.
+- **Loader** (`src/gguf_model.cpp`, used by julia1-cli and the C API, and `julia1_gguf/reader.py` for the numpy
+  backend): the layout follows `general.architecture`. A `modern-bert` file must carry the decision keys
+  (`modern-bert.decision.type` = `laya`) and Julia-1's template byte for byte; the decision blocks `blk.22`/`blk.23`,
+  `cls.*` and `token_types.weight` are the decision head and scorer, and the encoding ids and added tokens come from the
+  tokenizer keys ([SPEC.md](SPEC.md) §2–§3). The `julia1` layout of the 0.1.0 files still loads. Encoder-only files,
+  `laya`-architecture files and models with another template (Laya) are rejected with a message.
+- In llama.cpp's layout the head and scorer matrices may be stored in the file's type (F16, BF16, Q8_0); in the `julia1`
+  layout they stay F32. The numpy backend accepts `cls.output.weight` stored 1-D, as `llama-quantize` writes it.
+- [SPEC.md](SPEC.md) documents llama.cpp's layout as the primary file format and `julia1` as legacy;
+  `tools/convert_julia1_to_gguf.py` still writes the `julia1` layout. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) §F
+  compares llama.cpp master's `/v1/systemone` with the reference and with `julia1-cli serve`.
+
+The runtime still builds against the ggml of llama.cpp v0.5.0 with `patches/ggml-julia1.patch`.
+
+### Results
+
+The same F32 weights give byte-identical output in both layouts (`decide` on Metal, exact and `--fast --batch 16`, the C
+API on the CPU, and the numpy backend): typed set 2000/2000, accuracy 1451, max abs logit 8.24e-4 (Metal exact), 0
+encoding mismatches; parity set 100/100 on the CPU, max abs 1.57e-4. The tokenizer matches HF `tokenizers` on the 4595
+strings in both layouts. The 0.1.0 results below and in docs/BENCHMARKS.md hold for the F32 file.
+
 ## [0.1.0] — 2026-09-29
 
 First release: a GGUF runtime for [SupersonicLabs/Julia-1](https://huggingface.co/SupersonicLabs/Julia-1), a decision

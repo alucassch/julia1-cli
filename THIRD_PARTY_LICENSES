@@ -180,9 +180,10 @@ SOFTWARE.
 B. Model and tokenizer
 ----------------------
 
-The GGUF files (https://huggingface.co/andrelucas/Julia-1-GGUF) are converted from the Julia-1 checkpoint by
-tools/convert_julia1_to_gguf.py. They carry the weights of Julia-1 and the encoder and tokenizer that Julia-1 inherits
-from mmBERT-small.
+The GGUF files (https://huggingface.co/andrelucas/Julia-1-GGUF) are converted from the Julia-1 checkpoint by llama.cpp's
+convert_hf_to_gguf.py (llama.cpp master with pull request #29818, MIT License, text (1)); the files of julia1-cli 0.1.0
+by tools/convert_julia1_to_gguf.py. They carry the weights of Julia-1 and the encoder and tokenizer that Julia-1
+inherits from mmBERT-small.
 
   component                      source                                              license
   Julia-1 (weights, decision     https://huggingface.co/SupersonicLabs/Julia-1       Apache License 2.0 (6)
